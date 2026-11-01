@@ -171,7 +171,11 @@ async function warmUp($: EngineInterface, e: any) {
     doneById.set(id, t)
     doneTexts.add(t)
   }
-  if (modeNow !== 'render' || !(await imagesOn($))) return
+  const on = await imagesKnown($).catch(() => {
+    warmed = false // aborted: warm up on a later ask
+    return false
+  })
+  if (modeNow !== 'render' || !on) return
   await cells($, e.viewport.columns)
   lastRoom ??= roomOf(e.viewport.columns)
   // Newest first: the reader is at the bottom.
@@ -1117,7 +1121,10 @@ async function padInline($: EngineInterface, tex: string, room: number): Promise
     const offset = `${dx > 0 ? `-${dx}` : '+0'}${top > 0 ? `-${top}` : '+0'}`
     const args = ['magick', sized.path, '-background', 'none', '-gravity', 'northwest', '-extent', `${canvasW}x${rows * ROW_PX}${offset}`,
       '-crop', `${canvasW}x${ROW_PX}`, '+repage', `${stem}-%d.png`]
-    const cut = await $.process.run(args, { timeoutMs: 15000 }).catch(() => undefined)
+    const cut = await $.process.run(args, { timeoutMs: 15000 }).catch(err => {
+      if (isAbort(err)) throw err // asked again, not kept as undrawable
+      return undefined
+    })
     if (cut?.exitCode !== 0) return undefined
   }
   void down
@@ -1128,14 +1135,21 @@ function showMode($: EngineInterface, current: Mode): void {
   $.ui.status(current === 'source' ? 'LaTeX: source (/latex to render)' : undefined)
 }
 
-function imagesOn($: EngineInterface): Promise<boolean> {
+// Whether pictures can be drawn here. An aborted probe (a reload kills the
+// processes in flight) is no answer: imagesKnown rejects, nothing remembers it,
+// and it is asked again; imagesOn reads it as "not now" for a row drawn at once.
+function imagesKnown($: EngineInterface): Promise<boolean> {
   canDraw ??= detectImages($, settings.images).catch(err => {
     canDraw = undefined
-    if (isAbort(err)) redrawLater($)
+    if (isAbort(err)) {
+      redrawLater($)
+      throw err
+    }
     return false
   })
   return canDraw
 }
+const imagesOn = ($: EngineInterface) => imagesKnown($).catch(() => false)
 
 // A tool check: whether the program ran fine; an aborted run is passed on, to be asked again.
 const works = (run: Promise<{ exitCode: number }>) =>
@@ -1173,8 +1187,11 @@ async function detectImages($: EngineInterface, option: string): Promise<boolean
 // Figures take pdflatex and pdftocairo besides what formulas take.
 // Whether figures are drawn here, once figuresOn has found out.
 let figuresDrawn = false
-function figuresOn($: EngineInterface): Promise<boolean> {
-  canDrawFigures ??= imagesOn($)
+// Like imagesKnown: an aborted probe rejects and is forgotten. (A `false` read
+// from an aborted probe used to be kept here, and each figure typeset meanwhile
+// was kept as undrawable: after a reload figures showed as code until restart.)
+function figuresKnown($: EngineInterface): Promise<boolean> {
+  canDrawFigures ??= imagesKnown($)
     .then(async on => {
       if (!on) return false
       const tools = await Promise.all(['pdflatex', 'pdftocairo'].map(tool => works($.process.run([tool, '-v']))))
@@ -1183,11 +1200,15 @@ function figuresOn($: EngineInterface): Promise<boolean> {
     })
     .catch(err => {
       canDrawFigures = undefined
-      if (isAbort(err)) redrawLater($)
+      if (isAbort(err)) {
+        redrawLater($)
+        throw err
+      }
       return false
     })
   return canDrawFigures
 }
+const figuresOn = ($: EngineInterface) => figuresKnown($).catch(() => false)
 
 function cache($: EngineInterface): Promise<string> {
   cacheDir ??= findCacheDir($)
@@ -1307,7 +1328,7 @@ async function measure($: EngineInterface, png: string): Promise<Typeset | undef
 
 async function runTikz($: EngineInterface, segment: Figure): Promise<Typeset | undefined> {
   const fid = failureId('figure', segment.tex)
-  if (!(await figuresOn($))) return undefined
+  if (!(await figuresKnown($))) return undefined
   if (!isSafeTex(segment.tex)) return void failures.set(fid, UNSAFE_NOTE)
   const dir = await cache($)
   const { ink, paper } = await palette($)
@@ -1377,7 +1398,10 @@ async function padToCells($: EngineInterface, segment: Drawn, room: number, rowL
     const args = ['magick', base.path]
     if (shrink < 1) args.push('-resize', `${width}x${height}!`)
     args.push('-background', 'none', '-gravity', 'west', '-extent', `${Math.round(columns * cellW)}x${rows * ROW_PX}`, out)
-    const padded = await $.process.run(args, { timeoutMs: 15000 }).catch(() => undefined)
+    const padded = await $.process.run(args, { timeoutMs: 15000 }).catch(err => {
+      if (isAbort(err)) throw err // asked again, not kept unpadded
+      return undefined
+    })
     // Without ImageMagick the picture is drawn unpadded, a little stretched.
     if (padded?.exitCode !== 0) return { path: base.path, columns, rows }
   }
