@@ -80,7 +80,7 @@ type Figure = Segment & { kind: 'figure' }
 type Drawn = Display | Figure
 type Palette = { ink: string; paper?: string }
 type Typeset = { path: string; width: number; height: number }
-type Picture = { path: string; columns: number; rows: number; rowsAbove?: number }
+type Picture = { path: string; columns: number; rows: number; rowsAbove?: number; slices?: string[] }
 
 type Settings = {
   images: string
@@ -407,7 +407,7 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
   if (!settings.inline || !Image || !hasInlineMath(md)) return [<Markdown text={inlineToUnicode(md)} />]
   const out: JSX.Element[] = []
   const room = lastRoom ?? 76
-  type Placed = { x: number; width: number; el: (top: number) => JSX.Element; up: number; down: number; isText: boolean }
+  type Placed = { x: number; width: number; cells: (row: number) => [number, JSX.Element][]; up: number; down: number; isText: boolean }
   type Line = { items: Placed[]; gap: number; starts: boolean; heading: boolean; marker?: { x: number; text: string }; quote?: number }
   let group: Line[] = []
   let overhang = 0
@@ -452,19 +452,33 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
       last = row
     }
     const height = Math.max(...[...taken.keys()]) + 1
-    const children: JSX.Element[] = []
+    // Laid out row by row in the normal flow (no absolute positions, which do
+    // not clip when scrolled): each row holds its pieces left to right, a
+    // formula taller than a row contributing one strip to each row it covers.
+    const grid: { x: number; width: number; el: JSX.Element }[][] = Array.from({ length: height }, () => [])
     for (const { line, row } of placed) {
-      if (line.marker) children.push(<Box position="absolute" top={row} left={line.marker.x}><Text>{line.marker.text}</Text></Box>)
-      if (line.quote !== undefined) children.push(<Box position="absolute" top={row} left={line.quote}><Text dimColor>▎</Text></Box>)
-      for (const item of line.items) children.push(item.el(row))
+      if (line.marker) grid[row]!.push({ x: line.marker.x, width: textWidth(line.marker.text), el: <Text>{line.marker.text}</Text> })
+      if (line.quote !== undefined) grid[row]!.push({ x: line.quote, width: 1, el: <Text dimColor>▎</Text> })
+      for (const item of line.items) item.cells(row).forEach(([r, el]) => grid[r]?.push({ x: item.x, width: item.width, el }))
     }
+    const children = grid.map(pieces => {
+      pieces.sort((p, q) => p.x - q.x)
+      let at = 0
+      const row: JSX.Element[] = []
+      for (const piece of pieces) {
+        if (piece.x > at) row.push(<Box width={piece.x - at} flexShrink={0} />)
+        row.push(<Box flexShrink={0}>{piece.el}</Box>)
+        at = Math.max(at, piece.x + piece.width)
+      }
+      return <Box flexDirection="row" height={1}>{row}</Box>
+    })
     // Rows the first line's formulas reach above its text count toward the gap before the canvas.
     const lead = placed[0]?.row ?? 0
     const top = Math.max(0, marginTop - lead)
     if (out.length === 0) firstRow = top + lead
     // Rows under the last line of text hold only overhanging formulas: they count toward the next gap.
     overhang = height - 1 - (placed[placed.length - 1]?.row ?? height - 1)
-    out.push(<Box marginTop={top} position="relative" height={height} flexShrink={0}>{children}</Box>)
+    out.push(<Box marginTop={top} flexDirection="column" flexShrink={0}>{children}</Box>)
     group = []
   }
 
@@ -514,21 +528,20 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
         for (const { part, width, pic } of token.parts) {
           const at = x
           if (part.kind === 'md') {
-            items.push({ x: at, width, up: 0, down: 0, isText: true, el: top => <Box position="absolute" top={top} left={at}><Markdown text={part.text} /></Box> })
+            items.push({ x: at, width, up: 0, down: 0, isText: true, cells: row => [[row, <Markdown text={part.text} />]] })
           } else if (pic) {
             const up = pic.rowsAbove ?? 0
             const id = key()
+            const alt = texToUnicode(part.tex) || ' '
+            const slices = pic.slices ?? [pic.path]
             items.push({
               x: at, width, up, down: pic.rows - 1 - up, isText: false,
-              el: top => (
-                <Box position="absolute" top={top - up} left={at}>
-                  <Image key={id} source={{ file: pic.path, format: 'png' }} columns={pic.columns} rows={pic.rows} alt={texToUnicode(part.tex) || ' '} />
-                </Box>
-              ),
+              // The text row's strip carries the alt text where no picture can be drawn.
+              cells: row => slices.map((file, r) => [row - up + r, <Image key={`${id}-${r}`} source={{ file, format: 'png' }} columns={pic.columns} rows={1} alt={r === up ? alt : ' '} />]),
             })
           } else {
             const alt = escapeMarkdown(texToUnicode(part.tex) || ' ')
-            items.push({ x: at, width, up: 0, down: 0, isText: true, el: top => <Box position="absolute" top={top} left={at}><Markdown text={alt} /></Box> })
+            items.push({ x: at, width, up: 0, down: 0, isText: true, cells: row => [[row, <Markdown text={alt} />]] })
           }
           x += width
         }
@@ -570,11 +583,13 @@ function fitInline($: EngineInterface, tex: string, room: number): Promise<Pictu
   return pending
 }
 
-function typesetInline($: EngineInterface, tex: string): Promise<InlineSet | undefined> {
-  const id = `${ROW_PX}\u0000${tex}`
+// `size` scales the type: a formula shrunk to spare a row is typeset again at
+// its final size, so its glyphs are drawn crisp rather than resampled.
+function typesetInline($: EngineInterface, tex: string, size = 1): Promise<InlineSet | undefined> {
+  const id = `${ROW_PX}\u0000${size.toFixed(3)}\u0000${tex}`
   let pending = inlineTypeset.get(id)
   if (!pending) {
-    pending = slot(() => runInlineLatex($, tex)).catch(() => undefined)
+    pending = slot(() => runInlineLatex($, tex, size)).catch(() => undefined)
     inlineTypeset.set(id, pending)
   }
   return pending
@@ -593,7 +608,7 @@ async function slot<T>(job: () => Promise<T>): Promise<T> {
   }
 }
 
-async function runInlineLatex($: EngineInterface, tex: string): Promise<InlineSet | undefined> {
+async function runInlineLatex($: EngineInterface, tex: string, scale: number): Promise<InlineSet | undefined> {
   if (!isSafeTex(tex)) return undefined
   const dir = await cache($)
   const { ink } = await palette($)
@@ -609,7 +624,7 @@ async function runInlineLatex($: EngineInterface, tex: string): Promise<InlineSe
     '\\end{document}',
     '',
   ].join('\n')
-  const dpi = Math.round((0.98 * ROW_PX * settings.inlineScale * 72.27) / 10)
+  const dpi = Math.round((0.98 * ROW_PX * settings.inlineScale * scale * 72.27) / 10)
   const key = hashKey([VERSION, 'inline', doc, fg, dpi].join('\u0000'))
   const png = `${dir}/${key}.png`
   const meta = `${dir}/${key}.json`
@@ -664,24 +679,28 @@ async function padInline($: EngineInterface, tex: string, room: number): Promise
       if (cost < best.cost - 1e-9) best = { cost, shrink: k, shift, up, down }
     }
   }
-  const shrink = best.shrink
   const { up, down } = best
   const rows = 1 + up + down
-  const width = Math.max(1, Math.round(t.width * shrink))
-  const height = Math.max(1, Math.round(t.height * shrink))
-  const columns = clamp(Math.ceil(width / cellW), 1, 255)
+  const sized = best.shrink < 0.999 ? await typesetInline($, tex, Math.round(best.shrink * 1000) / 1000) : t
+  if (!sized) return undefined
+  const columns = clamp(Math.ceil(sized.width / cellW), 1, 255)
   const canvasW = Math.round(columns * cellW)
-  const canvasH = rows * ROW_PX
-  const top = Math.max(0, Math.round(up * ROW_PX + base - best.shift - t.above * shrink))
-  const dx = Math.max(0, Math.floor((canvasW - width) / 2))
-  const out = t.path.replace(/\.png$/, `-i${columns}x${rows}t${top}w${width}.png`)
-  if (!(await $.fs.exists(out))) {
+  const top = Math.max(0, Math.round(up * ROW_PX + base - best.shift - sized.above))
+  const dx = Math.max(0, Math.floor((canvasW - sized.width) / 2))
+  // Cut into one strip per row: each strip is ordinary one-row content, which
+  // scrolls and clips as text does, and at the terminal's own cell size the
+  // strips meet without a seam.
+  const stem = sized.path.replace(/\.png$/, `-i${columns}x${rows}t${top}c${ROW_PX}`)
+  const slices = Array.from({ length: rows }, (_, r) => `${stem}-${r}.png`)
+  if (!(await $.fs.exists(slices[rows - 1]!))) {
     const offset = `${dx > 0 ? `-${dx}` : '+0'}${top > 0 ? `-${top}` : '+0'}`
-    const args = ['magick', t.path, '-resize', `${width}x${height}!`, '-background', 'none', '-gravity', 'northwest', '-extent', `${canvasW}x${canvasH}${offset}`, out]
-    const padded = await $.process.run(args, { timeoutMs: 15000 }).catch(() => undefined)
-    if (padded?.exitCode !== 0) return undefined
+    const args = ['magick', sized.path, '-background', 'none', '-gravity', 'northwest', '-extent', `${canvasW}x${rows * ROW_PX}${offset}`,
+      '-crop', `${canvasW}x${ROW_PX}`, '+repage', `${stem}-%d.png`]
+    const cut = await $.process.run(args, { timeoutMs: 15000 }).catch(() => undefined)
+    if (cut?.exitCode !== 0) return undefined
   }
-  return { path: out, columns, rows, rowsAbove: up }
+  void down
+  return { path: slices[0]!, columns, rows, rowsAbove: up, slices }
 }
 
 function showMode($: EngineInterface, current: Mode): void {
