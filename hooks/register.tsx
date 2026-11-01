@@ -358,6 +358,7 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
   type Placed = { x: number; width: number; el: (top: number) => JSX.Element; up: number; down: number; isText: boolean }
   type Line = { items: Placed[]; gap: number; marker?: { x: number; text: string }; quote?: number }
   let group: Line[] = []
+  let overhang = 0
   firstRow = 0
 
   const flushGroup = (marginTop: number) => {
@@ -395,6 +396,8 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
       for (const item of line.items) children.push(item.el(row))
     }
     if (out.length === 0) firstRow = marginTop + (placed[0]?.row ?? 0)
+    // Rows under the last line of text hold only overhanging formulas: they count toward the next gap.
+    overhang = height - 1 - (placed[placed.length - 1]?.row ?? height - 1)
     out.push(<Box marginTop={marginTop} position="relative" height={height} flexShrink={0}>{children}</Box>)
     group = []
   }
@@ -405,10 +408,14 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
     if (block.kind === 'markdown') {
       flushGroup(pendingGap)
       pendingGap = 0
-      out.push(<Box marginTop={gap}><Markdown text={inlineToUnicode(block.text)} /></Box>)
+      out.push(<Box marginTop={Math.max(0, gap - overhang)}><Markdown text={inlineToUnicode(block.text)} /></Box>)
+      overhang = 0
       return
     }
-    if (group.length === 0) pendingGap = gap
+    if (group.length === 0) {
+      pendingGap = Math.max(0, gap - overhang)
+      overhang = 0
+    }
     const markerWidth = block.marker ? textWidth(block.marker) + 1 : 0
     const left = block.indent + markerWidth + (block.quote ? 2 : 0)
     const avail = Math.max(10, room - left)
