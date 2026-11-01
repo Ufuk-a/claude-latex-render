@@ -8,11 +8,11 @@
 > - **Native pixels.** The terminal's real cell size is read from its pty, and every picture is made at exactly that size, so the terminal never rescales (and blurs) it. Shrunk formulas are typeset again at their final size rather than resampled.
 > - **Failed LaTeX shows as written**, in the theme's error color, copyable. `mathrsfs`, `cancel` and `braket` are loaded.
 >
-> The demo below is the upstream version (with its preview strip, which this fork replaces).
+> The demo below is this fork, recorded in Ghostty (`.claude_scripts/record_demo.sh` makes it).
 
 A Claude Code mod that renders LaTeX math and TikZ figures in Claude's replies, right in the terminal.
 
-![Claude deriving the Fourier series of a square wave: the reply streams in with a live LaTeX preview, then shows typeset equations, a pgfplots figure of the first three partial sums with the Gibbs overshoot, and a tikz-cd square for the convolution theorem; /latex switches it to source and back](assets/demo.gif)
+![Claude Code in Ghostty streaming a LaTeX tour: inline math typeset inside bold and italic sentences, a continued fraction and a binomial in running text, lists with blackboard-bold and script letters, centred display math (cases, underbraces, an aligned Gaussian-integral derivation, a determinant), a tikz-cd diagram and a pgfplots surface, each appearing typeset as soon as it is written; then a scroll back to the top](assets/demo.gif)
 
 - **Display math** (`$$…$$`, `\[…\]`, `equation`, `align`, `gather`, …) is typeset with `latex` + `dvipng` and drawn as a crisp image through the kitty graphics protocol.
 - **TikZ figures** (a ` ```tikz ` fenced block, or a bare `tikzpicture` or `tikzcd` environment) are compiled with `pdflatex` + `pdftocairo` and drawn the same way. A fence may hold bare commands (`\draw …;`), which are wrapped in a `tikzpicture`. `pgfplots`, `tikz-cd` and the common TikZ libraries are loaded. On a dark theme `black` is the theme's ink and `white`, along with tints like `blue!20`, turns dark. Named colors too dim for a dark background (`blue`, `navy`, `violet`, `purple`, `brown`, `teal`, `darkgray`, …) are lightened; `navy`, `darkblue`, `maroon` and the other lowercase SVG names are defined on either theme.
