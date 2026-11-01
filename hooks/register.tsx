@@ -360,13 +360,13 @@ function drawnIn(text: string): Drawn[] {
   return splitMath(text).filter((s): s is Drawn => s.kind !== 'markdown')
 }
 
-// A formula or figure that failed: as written, copyable, in the error color, the reason under it.
-function errorBlock(els: any, source: string, reason: string): JSX.Element {
+// A formula or figure that failed: as written, copyable, in the error color.
+// The reason stays in the cache's .err file, for a tool to read when asked.
+function errorBlock(els: any, source: string, _reason: string): JSX.Element {
   const { Box, Text } = els
   return (
-    <Box flexDirection="column" marginLeft={2} marginY={1}>
+    <Box marginLeft={2} marginY={1}>
       <Text color="error">{source}</Text>
-      <Text color="error" dimColor>{`⚠ LaTeX: ${reason}`}</Text>
     </Box>
   )
 }
@@ -608,13 +608,6 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
     })
   })
   flushGroup(pendingGap)
-  if (failed.size > 0) {
-    out.push(
-      <Box flexDirection="column" marginTop={1}>
-        {[...failed].map(([written, reason]) => <Text color="error" dimColor>{`⚠ LaTeX in ${written}: ${reason}`}</Text>)}
-      </Box>,
-    )
-  }
   return out
 }
 
