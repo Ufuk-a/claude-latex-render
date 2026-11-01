@@ -27,13 +27,15 @@ record() {
 
 $(cat "$HERE/demo.md")"
   printf '%s' "$sys" > "$OUT/sys.txt"
+  local plug="--plugin-dir $MOD"
+  [[ -n "${NOMOD:-}" ]] && plug=""   # NOMOD=1: the same session without the mod, as a control
   cat > "$OUT/run.sh" <<EOF
 #!/bin/bash
 cd $OUT
 unset CLAUDE_CODE_CHILD_SESSION CLAUDECODE CLAUDE_CODE_ENTRYPOINT
 export MAX_THINKING_TOKENS=0 CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 CLAUDE_CODE_SANDBOXED=1
 unset CLAUDE_CODE_PLUGIN_DIRS
-exec /opt/claude-code/bin/claude --model opus --effort low --setting-sources project --strict-mcp-config --plugin-dir $MOD --settings $OUT/demo-settings.json --append-system-prompt "\$(cat $OUT/sys.txt)" 'Show me a tour of LaTeX rendering in this terminal.'
+exec /opt/claude-code/bin/claude --model opus --effort low --setting-sources project --strict-mcp-config $plug --settings $OUT/demo-settings.json --append-system-prompt "\$(cat $OUT/sys.txt)" 'Show me a tour of LaTeX rendering in this terminal.'
 EOF
   echo '{"alwaysThinkingEnabled": false, "tui": "fullscreen"}' > "$OUT/demo-settings.json"
   chmod +x "$OUT/run.sh"

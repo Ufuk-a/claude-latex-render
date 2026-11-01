@@ -6,6 +6,6 @@ export type Live = { id: string; text: string; v: number }
 
 declare module 'claude-code' {
   interface PluginState {
-    'latex-render': { mode: Mode; live: Live }
+    'latex-render': { mode: Mode; live: Live; done: Record<string, string> }
   }
 }

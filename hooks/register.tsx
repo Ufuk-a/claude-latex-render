@@ -115,6 +115,10 @@ let colors: Promise<Palette> | undefined
 const mode = atom({ plugin: 'latex-render', key: 'mode' } as const, 'render' as Mode)
 // The part of the block being streamed that is held back, drawn above the prompt until it ends.
 const live = atom({ plugin: 'latex-render', key: 'live' } as const, { id: '', text: '', v: 0 } as Live)
+// Finished blocks by the id of the row they streamed in. In fullscreen that row
+// keeps showing its block and the engine's own drawing of it is left empty: a
+// row that changed height while off screen makes the engine's scroll jump.
+const done = atom({ plugin: 'latex-render', key: 'done' } as const, {} as Record<string, string>)
 // Why a formula or figure could not be typeset, by its kind and TeX: it is then
 // shown as written, in the error color, with this under it.
 const failures = new Map<string, string>()
@@ -187,7 +191,7 @@ export const register: Register = (on, options) => {
   on('turn.step', async function* ($, e, next) {
     const onTerminal = e.agentId === undefined && (await $.session.surfaces()).includes('terminal')
     if (!onTerminal || !settings.live || (await read($, mode)) === 'source') return yield* next(e)
-    type Held = { before: Chunk<'turn.step'>[]; first: Chunk<'turn.step'>; text: string; index: number; after: Chunk<'turn.step'>[] }
+    type Held = { id: string; before: Chunk<'turn.step'>[]; first: Chunk<'turn.step'>; text: string; index: number; after: Chunk<'turn.step'>[] }
     let waiting: Chunk<'turn.step'>[] = [] // engine items not yet known to open a text block
     let held: Held | undefined
     let settled = 0
@@ -200,6 +204,7 @@ export const register: Register = (on, options) => {
         // Everything in the block is typeset before the engine draws it, so the
         // finished message comes out at its final height and nothing moves after.
         await Promise.race([readyAll($, block.text), $.clock.sleep(3000)]).catch(() => undefined)
+        await update($, done, d => ({ ...d, [block.id]: block.text })).catch(() => undefined)
         yield* block.before
         yield { ...(block.first as object), text: block.text } as Chunk<'turn.step'>
         yield* block.after
@@ -219,7 +224,7 @@ export const register: Register = (on, options) => {
         } else if (chunk.kind === 'text') {
           yield* release()
           const id = `live-${e.turnId}-${e.index}-${blocks++}`
-          held = { before: waiting, first: chunk, text: chunk.text, index: chunk.index, after: [] }
+          held = { id, before: waiting, first: chunk, text: chunk.text, index: chunk.index, after: [] }
           waiting = []
           void $.ui.place({ id }).catch(() => undefined)
           const text = held.text
@@ -246,13 +251,20 @@ export const register: Register = (on, options) => {
     yield* release()
   })
 
-  // The live row: the held block drawn as the finished block will be.
+  // The live row: the held block drawn as the finished block will be; once the
+  // block is finished, in fullscreen, the finished block itself.
   on('ui.render', { component: 'Placed' }, async ($, e, next) => {
-    const state = await read($, live)
-    if (e.props.plugin !== $.plugin.name || e.props.id !== state.id || !state.text || e.surface !== 'terminal') return next(e)
-    await cells($, lastRoom === undefined ? undefined : lastRoom + 4)
-    lastRoom ??= TERM_COLS === undefined ? undefined : Math.max(10, TERM_COLS - 4)
-    const tree = await drawReply($, e, splitPending(state.text), { wait: false, bullet: true })
+    const [state, finished] = await Promise.all([read($, live), read($, done)])
+    if (e.props.plugin !== $.plugin.name || e.surface !== 'terminal') return next(e)
+    if (e.props.id === state.id && state.text) {
+      await cells($, lastRoom === undefined ? undefined : lastRoom + 4)
+      lastRoom ??= TERM_COLS === undefined ? undefined : Math.max(10, TERM_COLS - 4)
+      const tree = await drawReply($, e, splitPending(state.text), { wait: false, bullet: true })
+      return tree ?? next(e)
+    }
+    const text = finished[e.props.id]
+    if (text === undefined || !e.viewport || (await read($, mode)) === 'source') return next(e)
+    const tree = await drawReply($, e, text, { wait: true, bullet: true, plain: !hasMath(text) })
     return tree ?? next(e)
   })
 
@@ -260,6 +272,10 @@ export const register: Register = (on, options) => {
     // Read before anything else, so every reply is drawn again when it changes.
     if ((await read($, mode)) === 'source') return next(e)
     const text = e.props.text
+    if (e.surface === 'terminal' && e.viewport && !e.props.isSummary && Object.values(await read($, done)).includes(text)) {
+      const { Box } = $.ui.resolve(e) as any
+      return <Box />
+    }
     if (!hasMath(text)) return next(e)
     if (e.props.isSummary || e.surface !== 'terminal' || !(await imagesOn($))) {
       const rewritten = segmentsToUnicode(splitMath(text))
@@ -279,10 +295,10 @@ async function drawReply(
   $: EngineInterface,
   e: Parameters<EngineInterface['ui']['resolve']>[0],
   text: string,
-  opts: { wait: boolean; bullet: boolean },
+  opts: { wait: boolean; bullet: boolean; plain?: boolean },
 ): Promise<JSX.Element | undefined> {
   const room = lastRoom ?? 76
-  const segments = splitMath(text)
+  const segments = opts.plain ? [{ kind: 'markdown' as const, text }] : splitMath(text)
   const els = $.ui.resolve(e)
   const { Box, Text, Image, Markdown } = els as any
   const bump = () => update($, live, cur => ({ ...cur, v: cur.v + 1 })).catch(() => undefined)
