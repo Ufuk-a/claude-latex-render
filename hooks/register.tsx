@@ -132,7 +132,9 @@ async function recordFailure($: EngineInterface, id: string, file: string): Prom
 const ready = new Map<string, Picture | undefined>()
 const typeset = new Map<string, Promise<Typeset | undefined>>()
 const fitted = new Map<string, Promise<Picture | undefined>>()
-// Drawn replies by everything their drawing depends on (see drawReply).
+// Laid-out replies by everything their layout depends on (see drawReply), and
+// their trees by layout and window.
+const drawnLayouts = new Map<string, Layout>()
 const drawnTrees = new Map<string, JSX.Element>()
 // The width the last reply was drawn at, so a formula is fitted to it while still streaming.
 let lastRoom: number | undefined
@@ -291,7 +293,7 @@ export const register: Register = (on, options) => {
     }
     const text = finished[e.props.id]
     if (text === undefined || !e.viewport || (await read($, mode)) === 'source') return next(e)
-    const tree = await drawReply($, e, text, { wait: true, bullet: true, plain: !hasMath(text) })
+    const tree = await drawReply($, e, text, { wait: true, bullet: true, plain: !hasMath(text), onScreen: e.props.onScreen, viewRows: e.viewport?.rows })
     return tree ?? next(e)
   }))
 
@@ -310,7 +312,7 @@ export const register: Register = (on, options) => {
     }
     await cells($, e.viewport?.columns)
     lastRoom = Math.max(10, (e.viewport?.columns ?? TERM_COLS ?? 80) - 4)
-    const tree = await drawReply($, e, text, { wait: true, bullet: e.props.isFirstOfReply })
+    const tree = await drawReply($, e, text, { wait: true, bullet: e.props.isFirstOfReply, onScreen: e.props.onScreen, viewRows: e.viewport?.rows })
     return tree ?? next(e)
   }))
 }
@@ -322,17 +324,16 @@ async function drawReply(
   $: EngineInterface,
   e: Parameters<EngineInterface['ui']['resolve']>[0],
   text: string,
-  opts: { wait: boolean; bullet: boolean; plain?: boolean },
+  opts: { wait: boolean; bullet: boolean; plain?: boolean; onScreen?: { first: number; last: number } | null; viewRows?: number },
 ): Promise<JSX.Element | undefined> {
   const room = lastRoom ?? 76
-  // A finished reply is drawn again on every scroll step (its rows on screen
-  // change); the same inputs give back the same tree object, so neither this
-  // module nor the engine redoes the layout.
+  // A finished reply is laid out once: the engine draws it again on every
+  // scroll step that moves it, and only its window changes then.
   const memoKey = opts.wait
     ? [text, room, ROW_PX, cellWidth(), opts.bullet, opts.plain, e.surface, settings.inline, settings.displayAlign, failures.size].join('\u0000')
     : undefined
-  const memo = memoKey === undefined ? undefined : drawnTrees.get(memoKey)
-  if (memo) return memo
+  const memo = memoKey === undefined ? undefined : drawnLayouts.get(memoKey)
+  if (memo) return windowed(memo, memoKey!, opts.onScreen, opts.viewRows)
   const segments = opts.plain ? [{ kind: 'markdown' as const, text }] : splitMath(text)
   const els = $.ui.resolve(e)
   const { Box, Text, Image, Markdown } = els as any
@@ -362,7 +363,7 @@ async function drawReply(
     }
   }
 
-  const children: JSX.Element[] = []
+  const children: Part[] = []
   let pendingText = ''
   let keyer = 0
   let bulletRow = 0
@@ -372,7 +373,7 @@ async function drawReply(
     if (md.trim() === '') return void (pendingText = '')
     const drawn = drawProse(els, md, tex => inlinePics.get(tex), () => `p${keyer++}`)
     if (children.length === 0) bulletRow = firstRow
-    if (children.length > 0 && afterPicture && /^\s{0,3}#/.test(md)) children.push(<Box height={1} />)
+    if (children.length > 0 && afterPicture && /^\s{0,3}#/.test(md)) children.push({ el: <Box height={1} />, rows: 1 })
     children.push(...drawn)
     afterPicture = false
     pendingText = ''
@@ -383,12 +384,13 @@ async function drawReply(
       pendingText += s.text
     } else if (!picture && failures.has(failureId(s.kind, s.tex))) {
       flushText()
-      children.push(errorBlock(els, asWritten(s), failures.get(failureId(s.kind, s.tex))!))
+      const written = asWritten(s)
+      children.push({ el: errorBlock(els, written, failures.get(failureId(s.kind, s.tex))!), guess: 2 + guessRows(written, room - 2) })
     } else if (!picture) {
       pendingText += segmentsToUnicode([s])
     } else {
       flushText()
-      children.push(
+      children.push({ rows: picture.rows, el: (
         <Box {...(settings.displayAlign === 'center' ? { justifyContent: 'center' } : { marginLeft: 2 })}>
           <Image
             key={`${s.kind === 'figure' ? 'figure' : 'math'}-${index}`}
@@ -397,30 +399,128 @@ async function drawReply(
             rows={picture.rows}
             alt={s.kind === 'figure' ? 'TikZ figure' : texToUnicode(s.tex) || ' '}
           />
-        </Box>,
-      )
+        </Box>
+      ) })
       afterPicture = true
     }
   })
   flushText()
   if (children.length === 0) return undefined
   void Markdown
+  const layout: Layout = { parts: children, bulletRow, bullet: opts.bullet, Box, Text }
+  if (memoKey === undefined) return assemble(layout)
+  if (pictures.every((p, k) => p || segments[k]!.kind === 'markdown' || failures.has(failureId(segments[k]!.kind, (segments[k] as Drawn).tex)))) {
+    if (drawnLayouts.size >= 300) drawnLayouts.delete(drawnLayouts.keys().next().value!)
+    drawnLayouts.set(memoKey, layout)
+    return windowed(layout, memoKey, opts.onScreen, opts.viewRows)
+  }
+  return assemble(layout)
+}
+
+// A part of a drawn reply, in the column beside the bullet. With `rows` its
+// height is exact, so far from the viewport it can stand as that many blank
+// rows; with `guess` the engine wraps it (prose, an error) and it is always
+// drawn, the guess only placing what comes after; a `canvas` is the rows of
+// one block of prose with inline formulas, each exactly one row, under `top`.
+type Part = { el: JSX.Element; rows: number } | { el: JSX.Element; guess: number } | { canvas: JSX.Element[]; top: number }
+type Layout = { parts: Part[]; bulletRow: number; bullet: boolean; Box: any; Text: any }
+
+// Rows a Markdown text takes at `width` columns, about: blank and wrapped lines.
+function guessRows(md: string, width: number): number {
+  return md.split('\n').reduce((n, line) => n + Math.max(1, Math.ceil(textWidth(line) / Math.max(10, width))), 0)
+}
+
+// A window keeps half a viewport drawn beyond the rows in view on either side,
+// so a fast flick does not outrun the redraw, and snaps to WINDOW_STEP rows, so
+// most scroll steps hand back a tree already built.
+const WINDOW_STEP = 16
+const lastWindow = new Map<string, string>()
+
+// The reply drawn for where it is on screen: in full where the surface does not
+// say; around the rows in view (a viewport's height either side) where it does;
+// as last drawn while off screen, where the terminal holds it anyway.
+function windowed(layout: Layout, memoKey: string, onScreen: { first: number; last: number } | null | undefined, viewRows?: number): JSX.Element {
+  if (onScreen === undefined) return cachedTree(layout, memoKey, undefined)
+  let span = onScreen === null ? lastWindow.get(memoKey) : undefined
+  if (onScreen) {
+    const margin = Math.max(24, Math.round((viewRows ?? 48) / 2))
+    const lo = Math.max(0, Math.floor((onScreen.first - margin) / WINDOW_STEP) * WINDOW_STEP)
+    const hi = Math.ceil((onScreen.last + 1 + margin) / WINDOW_STEP) * WINDOW_STEP
+    span = `${lo},${hi}`
+    lastWindow.set(memoKey, span)
+  }
+  return cachedTree(layout, memoKey, span)
+}
+
+function cachedTree(layout: Layout, memoKey: string, span: string | undefined): JSX.Element {
+  const id = `${memoKey}\u0000${span ?? 'all'}`
+  let tree = drawnTrees.get(id)
+  if (!tree) {
+    const [lo, hi] = span ? span.split(',').map(Number) : []
+    tree = assemble(layout, span ? [lo!, hi!] : undefined)
+    if (drawnTrees.size >= 300) drawnTrees.delete(drawnTrees.keys().next().value!)
+    drawnTrees.set(id, tree)
+  }
+  return tree
+}
+
+// The reply's tree. Given a window of rows (counted from the blank row above
+// the reply, as the terminal counts them), every exact part wholly outside it
+// is a blank of the same height, so the reply keeps its height to the row.
+function assemble(layout: Layout, window?: [number, number]): JSX.Element {
+  const { Box, Text } = layout
+  const children: JSX.Element[] = []
+  let blank = 0
+  const flushBlank = (into: JSX.Element[]) => {
+    if (blank > 0) into.push(<Box height={blank} flexShrink={0} />)
+    blank = 0
+  }
+  const outside = (from: number, rows: number) => window !== undefined && (from + rows <= window[0] || from >= window[1])
+  let y = 1 // the blank row above the reply is row 0
+  for (const part of layout.parts) {
+    if ('canvas' in part) {
+      const height = part.top + part.canvas.length
+      if (outside(y, height)) {
+        blank += height
+      } else {
+        flushBlank(children)
+        const rows: JSX.Element[] = []
+        part.canvas.forEach((row, k) => {
+          if (outside(y + part.top + k, 1)) blank++
+          else {
+            flushBlank(rows)
+            rows.push(row)
+          }
+        })
+        flushBlank(rows)
+        children.push(<Box marginTop={part.top} flexDirection="column" flexShrink={0}>{rows}</Box>)
+      }
+      y += height
+    } else if ('rows' in part) {
+      if (outside(y, part.rows)) blank += part.rows
+      else {
+        flushBlank(children)
+        children.push(part.el)
+      }
+      y += part.rows
+    } else {
+      flushBlank(children)
+      children.push(part.el)
+      y += part.guess
+    }
+  }
+  flushBlank(children)
   // The blank row the engine leaves above each message, which a drawing of our own must keep.
-  const tree = (
+  return (
     <Box flexDirection="row" marginTop={1}>
-      <Box width={2} flexShrink={0} marginTop={bulletRow}>
-        <Text>{opts.bullet ? '●' : ' '}</Text>
+      <Box width={2} flexShrink={0} marginTop={layout.bulletRow}>
+        <Text>{layout.bullet ? '●' : ' '}</Text>
       </Box>
       <Box flexDirection="column" flexGrow={1}>
         {children}
       </Box>
     </Box>
   )
-  if (memoKey !== undefined && pictures.every((p, k) => p || segments[k]!.kind === 'markdown' || failures.has(failureId(segments[k]!.kind, (segments[k] as Drawn).tex)))) {
-    if (drawnTrees.size >= 300) drawnTrees.delete(drawnTrees.keys().next().value!)
-    drawnTrees.set(memoKey, tree)
-  }
-  return tree
 }
 
 function drawnIn(text: string): Drawn[] {
@@ -513,11 +613,14 @@ function readyPicture(segment: Drawn, room: number): Picture | undefined {
 // Every word is still drawn by the engine's Markdown element.
 // The row the first drawn line of text sits on, for the reply's bullet.
 let firstRow = 0
-function drawProse(els: any, md: string, picture: (tex: string) => Picture | undefined, key: () => string): JSX.Element[] {
+function drawProse(els: any, md: string, picture: (tex: string) => Picture | undefined, key: () => string): Part[] {
   const { Box, Text, Markdown, Image } = els
-  if (!settings.inline || !Image || !hasInlineMath(md)) return [<Markdown text={inlineToUnicode(md)} />]
-  const out: JSX.Element[] = []
   const room = lastRoom ?? 76
+  if (!settings.inline || !Image || !hasInlineMath(md)) {
+    const flat = inlineToUnicode(md)
+    return [{ el: <Markdown text={flat} />, guess: guessRows(flat, room) }]
+  }
+  const out: Part[] = []
   type Placed = { x: number; width: number; cells: (row: number) => [number, JSX.Element][]; up: number; down: number; isText: boolean }
   type Line = { items: Placed[]; gap: number; starts: boolean; heading: boolean; marker?: { x: number; text: string }; quote?: number }
   let group: Line[] = []
@@ -603,7 +706,7 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
     if (out.length === 0) firstRow = top + lead
     // Rows under the last line of text hold only overhanging formulas: they count toward the next gap.
     overhang = height - 1 - (placed[placed.length - 1]?.row ?? height - 1)
-    out.push(<Box marginTop={top} flexDirection="column" flexShrink={0}>{children}</Box>)
+    out.push({ canvas: children, top })
     group = []
   }
 
@@ -614,7 +717,9 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
       flushGroup(pendingGap)
       pendingGap = 0
       const isHeading = /^\s{0,3}#/.test(block.text)
-      out.push(<Box marginTop={isHeading ? gap : Math.max(0, gap - overhang)}><Markdown text={inlineToUnicode(block.text)} /></Box>)
+      const above = isHeading ? gap : Math.max(0, gap - overhang)
+      const flat = inlineToUnicode(block.text)
+      out.push({ el: <Box marginTop={above}><Markdown text={flat} /></Box>, guess: above + guessRows(flat, room) })
       overhang = 0
       return
     }

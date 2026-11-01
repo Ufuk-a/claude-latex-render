@@ -7,7 +7,7 @@
 # Output in /tmp/scrollperf (log, screenshots); the last lines are the result.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
-MOD=$(dirname "$HERE")
+MOD=${MOD:-$(dirname "$HERE")}
 SRC=$1
 OUT=/tmp/scrollperf
 DISP=:96
@@ -49,6 +49,18 @@ xdotool mousemove 700 450
 xdotool click --repeat "${PRE:-0}" --delay 5 4
 sleep 4
 import -window root "$OUT/region.png" 2>/dev/null
+# SHOTS=N: step down STEP clicks at a time, a screenshot after each (to diff two builds).
+if [[ -n "${SHOTS:-}" ]]; then
+  mkdir -p "$OUT/shots-${TAG:-x}"
+  for k in $(seq -w 1 "$SHOTS"); do
+    xdotool click --repeat "${STEP:-4}" --delay 250 5
+    sleep 1.2
+    import -window root "$OUT/shots-${TAG:-x}/$k.png" 2>/dev/null
+  done
+  kill "$gh" 2>/dev/null; sleep 0.5; kill "$xv" 2>/dev/null
+  log "shots in $OUT/shots-${TAG:-x}"
+  exit 0
+fi
 c0=$(ticks "$cl"); g0=$(ticks "$gh"); t0=$(date +%s.%N)
 cp /tmp/latex-render-perf.json "$OUT/perf0.json" 2>/dev/null || echo '{}' > "$OUT/perf0.json"
 for _ in 1 2; do
