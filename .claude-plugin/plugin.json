@@ -1,12 +1,12 @@
 {
   "name": "latex-render",
-  "version": "0.5.1",
-  "description": "Renders LaTeX in Claude's replies: display math and TikZ figures as crisp images (kitty graphics protocol), inline math as Unicode",
+  "version": "0.6.0",
+  "description": "Renders LaTeX in Claude's replies, live and in place: display and inline math and TikZ figures as crisp images (kitty graphics protocol)",
   "author": {
-    "name": "arthgirard",
-    "url": "https://github.com/arthgirard"
+    "name": "Ufuk-a",
+    "url": "https://github.com/Ufuk-a"
   },
-  "repository": "https://github.com/arthgirard/claude-latex-render",
+  "repository": "https://github.com/Ufuk-a/claude-latex-render",
   "license": "MIT",
   "types": "./types/index.d.ts",
   "userConfig": {

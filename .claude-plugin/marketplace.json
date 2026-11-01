@@ -2,13 +2,13 @@
   "name": "claude-latex-render",
   "description": "LaTeX math rendering for Claude Code replies",
   "owner": {
-    "name": "arthgirard"
+    "name": "Ufuk-a"
   },
   "plugins": [
     {
       "name": "latex-render",
       "source": "./",
-      "description": "Renders LaTeX in Claude's replies: display math and TikZ figures as crisp images (kitty graphics protocol), inline math as Unicode"
+      "description": "Renders LaTeX in Claude's replies, live and in place: display and inline math and TikZ figures as crisp images (kitty graphics protocol)"
     }
   ]
 }
