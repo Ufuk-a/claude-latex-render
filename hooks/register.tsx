@@ -106,6 +106,15 @@ let colors: Promise<Palette> | undefined
 const mode = atom({ plugin: 'latex-render', key: 'mode' } as const, 'render' as Mode)
 // The part of the block being streamed that is held back, drawn above the prompt until it ends.
 const live = atom({ plugin: 'latex-render', key: 'live' } as const, { id: '', text: '', v: 0 } as Live)
+// Why a formula or figure could not be typeset, by its kind and TeX: it is then
+// shown as written, in the error color, with this under it.
+const failures = new Map<string, string>()
+const failureId = (kind: string, tex: string) => `${kind}\u0000${tex}`
+const UNSAFE_NOTE = 'not compiled: it uses a macro or file command (\\def, \\newcommand, \\input, ...)'
+async function recordFailure($: EngineInterface, id: string, file: string): Promise<undefined> {
+  failures.set(id, await $.fs.read(file).catch(() => 'LaTeX failed'))
+  return undefined
+}
 // Pictures already fitted, by fitId, so the band draws without waiting on TeX.
 const ready = new Map<string, Picture | undefined>()
 const typeset = new Map<string, Promise<Typeset | undefined>>()
@@ -273,7 +282,7 @@ async function drawReply(
     : segments.map(s => {
         if (s.kind === 'markdown') return undefined
         const ready = readyPicture(s, room)
-        if (!ready) void fit($, s, room).then(p => (p ? bump() : undefined))
+        if (!ready) void fit($, s, room).then(() => bump())
         return ready
       })
   const inlinePics = new Map<string, Picture | undefined>()
@@ -285,7 +294,7 @@ async function drawReply(
     } else {
       for (const tex of texes) {
         const ready = inlineReady.get(inlineId(tex, room))
-        if (!ready) void fitInline($, tex, room).then(p => (p ? bump() : undefined))
+        if (!ready) void fitInline($, tex, room).then(() => bump())
         inlinePics.set(tex, ready)
       }
     }
@@ -310,6 +319,9 @@ async function drawReply(
     const picture = pictures[index]
     if (s.kind === 'markdown') {
       pendingText += s.text
+    } else if (!picture && failures.has(failureId(s.kind, s.tex))) {
+      flushText()
+      children.push(errorBlock(els, asWritten(s), failures.get(failureId(s.kind, s.tex))!))
     } else if (!picture) {
       pendingText += segmentsToUnicode([s])
     } else {
@@ -346,6 +358,22 @@ async function drawReply(
 
 function drawnIn(text: string): Drawn[] {
   return splitMath(text).filter((s): s is Drawn => s.kind !== 'markdown')
+}
+
+// A formula or figure that failed: as written, copyable, in the error color, the reason under it.
+function errorBlock(els: any, source: string, reason: string): JSX.Element {
+  const { Box, Text } = els
+  return (
+    <Box flexDirection="column" marginLeft={2} marginY={1}>
+      <Text color="error">{source}</Text>
+      <Text color="error" dimColor>{`⚠ LaTeX: ${reason}`}</Text>
+    </Box>
+  )
+}
+
+function asWritten(s: Drawn): string {
+  if (s.kind === 'figure') return '```tikz\n' + s.tex.trim() + '\n```'
+  return s.env ? `\\begin{${s.env}}\n${s.tex.trim()}\n\\end{${s.env}}` : `$$\n${s.tex.trim()}\n$$`
 }
 
 // Typesets every formula and figure of a block, display and inline, at the sizes it will be drawn.
@@ -416,6 +444,7 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
   type Line = { items: Placed[]; gap: number; starts: boolean; heading: boolean; marker?: { x: number; text: string }; quote?: number }
   let group: Line[] = []
   let overhang = 0
+  const failed = new Map<string, string>() // inline formulas shown as written, and why
   firstRow = 0
 
   const flushGroup = (marginTop: number) => {
@@ -509,7 +538,8 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
       const parts = token.map(part => {
         if (part.kind === 'md') return { part, width: part.width, pic: undefined as Picture | undefined }
         const pic = picture(part.tex)
-        return { part, width: pic ? pic.columns : textWidth(texToUnicode(part.tex) || ' '), pic }
+        const width = pic ? pic.columns : failures.has(failureId('inline', part.tex)) ? textWidth(`$${part.tex}$`) : textWidth(texToUnicode(part.tex) || ' ')
+        return { part, width, pic }
       })
       return { parts, width: parts.reduce((w, p) => w + p.width, 0) }
     })
@@ -544,6 +574,10 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
               // The text row's strip carries the alt text where no picture can be drawn.
               cells: row => slices.map((file, r) => [row - up + r, <Image key={`${id}-${r}`} source={{ file, format: 'png' }} columns={pic.columns} rows={1} alt={r === up ? alt : ' '} />]),
             })
+          } else if (failures.has(failureId('inline', part.tex))) {
+            const written = `$${part.tex}$`
+            failed.set(written, failures.get(failureId('inline', part.tex))!)
+            items.push({ x: at, width: textWidth(written), up: 0, down: 0, isText: true, cells: row => [[row, <Text color="error">{written}</Text>]] })
           } else {
             const alt = escapeMarkdown(texToUnicode(part.tex) || ' ')
             items.push({ x: at, width, up: 0, down: 0, isText: true, cells: row => [[row, <Markdown text={alt} />]] })
@@ -563,6 +597,13 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
     })
   })
   flushGroup(pendingGap)
+  if (failed.size > 0) {
+    out.push(
+      <Box flexDirection="column" marginTop={1}>
+        {[...failed].map(([written, reason]) => <Text color="error" dimColor>{`⚠ LaTeX in ${written}: ${reason}`}</Text>)}
+      </Box>,
+    )
+  }
   return out
 }
 
@@ -614,13 +655,14 @@ async function slot<T>(job: () => Promise<T>): Promise<T> {
 }
 
 async function runInlineLatex($: EngineInterface, tex: string, scale: number): Promise<InlineSet | undefined> {
-  if (!isSafeTex(tex)) return undefined
+  const fid = failureId('inline', tex)
+  if (!isSafeTex(tex)) return void failures.set(fid, UNSAFE_NOTE)
   const dir = await cache($)
   const { ink } = await palette($)
   const fg = dvipngColor(ink) ?? 'rgb 0.9 0.9 0.9'
   const doc = [
     '\\documentclass[10pt]{article}',
-    '\\usepackage{amsmath,amssymb,amsfonts,mathtools,bm,xcolor}',
+    '\\usepackage{amsmath,amssymb,amsfonts,mathtools,bm,xcolor,mathrsfs,cancel,braket}',
     settings.preamble,
     `\\definecolor{black}{HTML}{${ink.replace('#', '')}}`,
     '\\usepackage[active,tightpage]{preview}',
@@ -634,7 +676,7 @@ async function runInlineLatex($: EngineInterface, tex: string, scale: number): P
   const png = `${dir}/${key}.png`
   const meta = `${dir}/${key}.json`
   const failed = `${dir}/${key}.err`
-  if (await $.fs.exists(failed)) return undefined
+  if (await $.fs.exists(failed)) return recordFailure($, fid, failed)
   if (!(await $.fs.exists(meta))) {
     await $.fs.write(`${dir}/${key}.tex`, doc)
     const latex = await $.process.run(
@@ -643,7 +685,7 @@ async function runInlineLatex($: EngineInterface, tex: string, scale: number): P
     )
     if (latex.exitCode !== 0) {
       await $.fs.write(failed, latexError(latex.stdout))
-      return undefined
+      return recordFailure($, fid, failed)
     }
     const dvipng = await $.process.run(
       ['dvipng', '-D', String(dpi), '-T', 'tight', '--depth', '--height', '-bg', 'Transparent', '-fg', fg, '-o', `${key}.png`, `${key}.dvi`],
@@ -653,7 +695,7 @@ async function runInlineLatex($: EngineInterface, tex: string, scale: number): P
     const m = /depth=(-?\d+) height=(-?\d+)/.exec(dvipng.stdout)
     if (dvipng.exitCode !== 0 || !m) {
       await $.fs.write(failed, dvipng.stderr || 'dvipng failed')
-      return undefined
+      return recordFailure($, fid, failed)
     }
     await $.fs.write(meta, JSON.stringify({ below: Number(m[1]), above: Number(m[2]) }))
   }
@@ -790,7 +832,8 @@ function typesetSegment($: EngineInterface, segment: Drawn): Promise<Typeset | u
 }
 
 async function runLatex($: EngineInterface, segment: Display): Promise<Typeset | undefined> {
-  if (!isSafeTex(segment.tex)) return undefined
+  const fid = failureId('display', segment.tex)
+  if (!isSafeTex(segment.tex)) return void failures.set(fid, UNSAFE_NOTE)
   const dir = await cache($)
   const { ink, paper } = await palette($)
   const fg = dvipngColor(ink) ?? 'rgb 0.9 0.9 0.9'
@@ -800,7 +843,7 @@ async function runLatex($: EngineInterface, segment: Display): Promise<Typeset |
   const png = `${dir}/${key}.png`
   const failed = `${dir}/${key}.err`
 
-  if (await $.fs.exists(failed)) return undefined
+  if (await $.fs.exists(failed)) return recordFailure($, fid, failed)
   if (!(await $.fs.exists(png))) {
     await $.fs.write(`${dir}/${key}.tex`, doc)
     const latex = await $.process.run(
@@ -809,7 +852,7 @@ async function runLatex($: EngineInterface, segment: Display): Promise<Typeset |
     )
     if (latex.exitCode !== 0) {
       await $.fs.write(failed, latexError(latex.stdout))
-      return undefined
+      return recordFailure($, fid, failed)
     }
     const dvipng = await $.process.run(
       ['dvipng', '-q', '-D', String(dpi), '-T', 'tight', '-bg', 'Transparent', '-fg', fg, '-o', `${key}.png`, `${key}.dvi`],
@@ -818,7 +861,7 @@ async function runLatex($: EngineInterface, segment: Display): Promise<Typeset |
     await $.process.run(['rm', '-f', `${key}.aux`, `${key}.log`, `${key}.dvi`], { cwd: dir }).catch(() => undefined)
     if (dvipng.exitCode !== 0) {
       await $.fs.write(failed, dvipng.stderr || 'dvipng failed')
-      return undefined
+      return recordFailure($, fid, failed)
     }
   }
 
@@ -837,7 +880,9 @@ async function measure($: EngineInterface, png: string): Promise<Typeset | undef
 }
 
 async function runTikz($: EngineInterface, segment: Figure): Promise<Typeset | undefined> {
-  if (!isSafeTex(segment.tex) || !(await figuresOn($))) return undefined
+  const fid = failureId('figure', segment.tex)
+  if (!(await figuresOn($))) return undefined
+  if (!isSafeTex(segment.tex)) return void failures.set(fid, UNSAFE_NOTE)
   const dir = await cache($)
   const { ink, paper } = await palette($)
   const doc = figureDocument(segment.tex, settings.preamble, ink, paper)
@@ -846,7 +891,7 @@ async function runTikz($: EngineInterface, segment: Figure): Promise<Typeset | u
   const png = `${dir}/${key}.png`
   const failed = `${dir}/${key}.err`
 
-  if (await $.fs.exists(failed)) return undefined
+  if (await $.fs.exists(failed)) return recordFailure($, fid, failed)
   if (!(await $.fs.exists(png))) {
     await $.fs.write(`${dir}/${key}.tex`, doc)
     const latex = await $.process.run(
@@ -855,7 +900,7 @@ async function runTikz($: EngineInterface, segment: Figure): Promise<Typeset | u
     )
     if (latex.exitCode !== 0) {
       await $.fs.write(failed, latexError(latex.stdout))
-      return undefined
+      return recordFailure($, fid, failed)
     }
     // pdftocairo names the picture itself, adding `.png` to the stem.
     const cairo = await $.process.run(
@@ -865,7 +910,7 @@ async function runTikz($: EngineInterface, segment: Figure): Promise<Typeset | u
     await $.process.run(['rm', '-f', `${key}.aux`, `${key}.log`, `${key}.pdf`], { cwd: dir }).catch(() => undefined)
     if (cairo.exitCode !== 0) {
       await $.fs.write(failed, cairo.stderr || 'pdftocairo failed')
-      return undefined
+      return recordFailure($, fid, failed)
     }
   }
   return measure($, png)

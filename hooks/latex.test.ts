@@ -8,6 +8,7 @@ import {
   hasMath,
   inlineToUnicode,
   isSafeTex,
+  latexError,
   nextMode,
   pngSize,
   segmentsToUnicode,
@@ -284,5 +285,15 @@ describe('settledLength', () => {
     expect(settledLength('```latex\n$$x$$\n```\n')).toBe(0)
     expect(settledLength('```latex\n$$x$$\n')).toBe(0)
     expect(settledLength('Use `$$x$$`\n')).toBe(0)
+  })
+})
+
+describe('latexError', () => {
+  test('an unknown command is named', async () => {
+    const log = 'stuff\n! Undefined control sequence.\n<recently read> \\mathscr \n                         \nl.3 $\\mathscr\n'
+    expect(latexError(log)).toBe('Undefined control sequence: \\mathscr')
+  })
+  test('another error keeps its message', async () => {
+    expect(latexError('! Missing $ inserted.\n<inserted text>\nl.9 x^\n')).toBe('Missing $ inserted')
   })
 })

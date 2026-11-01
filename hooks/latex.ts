@@ -623,7 +623,7 @@ export function texDocument(segment: { tex: string; env?: string }, preamble: st
   if (env === 'alignat*' && !body.trimStart().startsWith('{')) env = 'align*'
   return [
     '\\documentclass[10pt]{article}',
-    '\\usepackage{amsmath,amssymb,amsfonts,mathtools,bm,xcolor}',
+    '\\usepackage{amsmath,amssymb,amsfonts,mathtools,bm,xcolor,mathrsfs,cancel,braket}',
     ...figureColors(Boolean(paper)),
     preamble,
     ...(ink ? [`\\definecolor{black}{HTML}{${ink.replace('#', '')}}`] : []),
@@ -652,7 +652,7 @@ export function figureDocument(tex: string, preamble: string, ink: string, paper
   const dark = paper ? hexRgb(paper) : undefined
   return [
     '\\documentclass[tikz,border=4pt]{standalone}',
-    '\\usepackage{amsmath,amssymb,amsfonts,mathtools,bm,pgfplots}',
+    '\\usepackage{amsmath,amssymb,amsfonts,mathtools,bm,pgfplots,mathrsfs,cancel,braket}',
     '\\pgfplotsset{compat=1.18,every axis/.append style={axis on top}}',
     '\\usetikzlibrary{arrows.meta,calc,cd,decorations.pathreplacing,patterns,positioning,shapes.geometric}',
     ...figureColors(Boolean(paper)),
@@ -792,8 +792,14 @@ export function dvipngColor(hex: string): string | undefined {
 
 /** The first error line of a LaTeX log. */
 export function latexError(log: string): string {
-  const line = log.split('\n').find(l => l.startsWith('! '))
-  return line ? line.slice(2).trim() : 'LaTeX failed'
+  const lines = log.split('\n')
+  const at = lines.findIndex(l => l.startsWith('! '))
+  if (at < 0) return 'LaTeX failed'
+  const message = lines[at]!.slice(2).trim().replace(/\.$/, '')
+  // The `l.N …` line ends where TeX stopped: for an unknown command, the command itself.
+  const where = lines.slice(at + 1, at + 8).find(l => /^l\.\d+ /.test(l))
+  const culprit = where && /(\\[A-Za-z@]+|\S)\s*$/.exec(where.replace(/^l\.\d+ /, ''))?.[1]
+  return culprit && message.startsWith('Undefined control sequence') ? `${message}: ${culprit}` : message
 }
 
 const UNSAFE = /\\(?:input|include|includeonly|InputIfFileExists|openin|openout|closein|closeout|read|readline|write|message|immediate|special|catcode|uccode|lccode|csname|endcsname|string|def|edef|gdef|xdef|let|futurelet|expandafter|noexpand|newcommand|renewcommand|providecommand|DeclareRobustCommand|usepackage|RequirePackage|documentclass|begin\s*\{\s*document|end\s*\{\s*document|directlua|latelua|pdffilesize|filesize|verbatiminput|lstinputlisting|includegraphics|newread|newwrite|jobname|loop|repeat)(?![a-zA-Z])|\^\^/
