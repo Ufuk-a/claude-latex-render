@@ -86,12 +86,12 @@
     "displayAlign": {
       "type": "string",
       "title": "Display math alignment",
-      "description": "center: display formulas and figures centred across the reply's width; left: at the left margin",
+      "description": "left: display formulas and figures at the left margin; center: centred across the reply's width",
       "options": [
-        "center",
-        "left"
+        "left",
+        "center"
       ],
-      "default": "center"
+      "default": "left"
     }
   }
 }

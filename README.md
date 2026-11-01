@@ -57,6 +57,7 @@ In `/config`:
 | `cellAspect` | `2.1` | Cell height ÷ width, used only where the terminal's cell size cannot be read; raise it if formulas look squashed, lower it if stretched |
 | `preamble` | empty | Extra LaTeX preamble, e.g. `\usepackage{physics}` |
 | `preview` | `on` | `on`: each text block streams typeset, in place; `off`: the reply streams raw and is typeset when its block ends |
+| `displayAlign` | `left` | `left`: display math and figures at the left margin; `center`: centred across the reply |
 | `inlineImages` | `on` | `on`: inline math typeset as images in the line; `off`: inline math as Unicode |
 | `inlineScale` | `1` | Size of inline formulas relative to the terminal text |
 | `inlineBaseline` | `0.8` | Where the font's baseline sits in a cell, as a fraction of its height from the top |

@@ -106,7 +106,7 @@ type Settings = {
 
 // What the module learns once per load: its options, whether pictures can be
 // drawn, the cache folder, the colors, and every formula and figure typeset so far.
-let settings: Settings = { images: 'auto', color: 'auto', scale: 1.25, cellAspect: 2.1, preamble: '', background: 'auto', live: true, inline: true, inlineScale: 1, inlineBaseline: 0.8, displayAlign: 'center' }
+let settings: Settings = { images: 'auto', color: 'auto', scale: 1.25, cellAspect: 2.1, preamble: '', background: 'auto', live: true, inline: true, inlineScale: 1, inlineBaseline: 0.8, displayAlign: 'left' }
 let canDraw: Promise<boolean> | undefined
 let canDrawFigures: Promise<boolean> | undefined
 let cacheDir: Promise<string> | undefined
@@ -143,7 +143,7 @@ export const register: Register = (on, options) => {
     inline: String(options.inlineImages ?? 'on') !== 'off',
     inlineScale: clamp(Number(options.inlineScale) || 1, 0.5, 2),
     inlineBaseline: clamp(Number(options.inlineBaseline) || 0.8, 0.5, 0.95),
-    displayAlign: String(options.displayAlign ?? 'center') === 'left' ? 'left' : 'center',
+    displayAlign: String(options.displayAlign ?? 'left') === 'center' ? 'center' : 'left',
   }
   // What was found for the previous options no longer holds.
   canDraw = canDrawFigures = colors = undefined
