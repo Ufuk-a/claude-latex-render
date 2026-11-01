@@ -60,6 +60,28 @@
         "off"
       ],
       "default": "on"
+    },
+    "inlineImages": {
+      "type": "string",
+      "title": "Inline math as images",
+      "description": "on: inline $\u2026$ is typeset by LaTeX and drawn inside the line (a line with a tall formula grows to two rows); off: inline math as Unicode text",
+      "options": [
+        "on",
+        "off"
+      ],
+      "default": "on"
+    },
+    "inlineScale": {
+      "type": "number",
+      "title": "Inline formula scale",
+      "description": "Size of inline formulas relative to the terminal text; raise it if they look small",
+      "default": 1
+    },
+    "inlineBaseline": {
+      "type": "number",
+      "title": "Inline baseline",
+      "description": "Where the terminal font's baseline sits in a cell, as a fraction of its height from the top; nudge it if inline formulas sit too high or too low",
+      "default": 0.8
     }
   }
 }

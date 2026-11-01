@@ -176,7 +176,7 @@ export function displayToUnicode(tex: string): string {
   return '\n\n' + lines.map(line => '    ' + line).join('  \n') + '\n\n'
 }
 
-function splitFences(text: string): { text: string; isCode: boolean }[] {
+export function splitFences(text: string): { text: string; isCode: boolean }[] {
   const blocks: { text: string; isCode: boolean }[] = []
   let current = ''
   let fence: string | undefined
@@ -713,19 +713,26 @@ function figureColors(dark: boolean): string[] {
 }
 
 /** What a reply drawn here can show: pictures at all, figures, and a dark theme's background. */
-export type StyleFacts = { pictures: boolean; figures: boolean; paper?: string }
+const INLINE_PICTURES = [
+  '- Inline math is typeset by LaTeX and drawn as images inside the line, so write it naturally: `$\\frac{a}{b}$`, `$\\hat{x}$`, `$\\mathcal{L}$` and `$\\sum_{i=1}^n$` all look as in a paper. A line holding a tall inline formula grows to two rows, so keep big constructs (matrices, `cases`, multi-line work) in display math.',
+]
+const INLINE_UNICODE = [
+  '- Inline math is turned into Unicode text, so keep it to symbols, Greek letters, sub- and superscripts, operators and short fractions like `$a/b$`. Anything taller (stacked fractions, matrices, `cases`, sums or integrals with limits) goes in display math.',
+  `- Inline subscripts become Unicode only for digits, signs and the letters ${SUBSCRIPT_LETTERS}. Any other, like the N in \`$S_N$\`, is left as \`_N\`. When the notation is yours to choose, pick letters that have one (\`$S_n$\`, \`$x_k$\`); when it is fixed, put a formula that should look typeset in display math.`,
+]
+
+export type StyleFacts = { pictures: boolean; figures: boolean; paper?: string; inlinePictures?: boolean }
 
 /**
  * The system prompt section that tells the model how to write math and
  * figures so this mod draws them well.
  */
-export function styleGuide({ pictures, figures, paper }: StyleFacts): string {
+export function styleGuide({ pictures, figures, paper, inlinePictures }: StyleFacts): string {
   const lines = [
     '# Math and figures',
     'Your replies are shown in a terminal that renders LaTeX (the latex-render plugin). Write math and figures in the forms it renders:',
     '- Write math in LaTeX rather than plain-text approximations like x^2 or sqrt(x): inline `$…$`, display `$$…$$` on lines of its own (or an `align`, `gather` or `equation` environment).',
-    '- Inline math is turned into Unicode text, so keep it to symbols, Greek letters, sub- and superscripts, operators and short fractions like `$a/b$`. Anything taller (stacked fractions, matrices, `cases`, sums or integrals with limits) goes in display math.',
-    `- Inline subscripts become Unicode only for digits, signs and the letters ${SUBSCRIPT_LETTERS}. Any other, like the N in \`$S_N$\`, is left as \`_N\`. When the notation is yours to choose, pick letters that have one (\`$S_n$\`, \`$x_k$\`); when it is fixed, put a formula that should look typeset in display math.`,
+    ...(inlinePictures ? INLINE_PICTURES : INLINE_UNICODE),
     '- A bare number is plain text: write 0 or 3.5 rather than `$0$` or `$3.5$`.',
     '- Never put math meant to be read in a code block or inline code, which show raw LaTeX. Use a ```latex block only when asked for LaTeX source.',
     '- Figures, graphs, plots and commutative diagrams (including pgfplots `axis` plots) always go in a ```tikz fenced block, never loose in the text and never in a ```latex block: bare TikZ commands, or a whole `tikzpicture`, `axis` or `tikzcd` environment. pgfplots, tikz-cd and the TikZ libraries arrows.meta, calc, cd, decorations.pathreplacing, patterns, positioning and shapes.geometric are loaded; write no `\\documentclass`, `\\usepackage` or `\\begin{document}`.',
@@ -794,4 +801,23 @@ const UNSAFE = /\\(?:input|include|includeonly|InputIfFileExists|openin|openout|
 /** Whether a formula is plain math: no file access, no macro or catcode tricks. */
 export function isSafeTex(tex: string): boolean {
   return !UNSAFE.test(tex)
+}
+
+/**
+ * Where inline formulas sit in a stretch of markdown (no fences): offsets of
+ * each whole `$…$` or `\(…\)`, its TeX, and for a number written as math
+ * (`$0$`) the plain text it stands for. Math inside code spans is not math.
+ */
+export function inlineSpans(text: string): { start: number; end: number; tex: string; plain?: string }[] {
+  const masked = text.replace(/(`+)[\s\S]*?\1/g, span => HOLE.repeat(span.length))
+  const out: { start: number; end: number; tex: string; plain?: string }[] = []
+  for (const m of masked.matchAll(INLINE)) {
+    const start = m.index ?? 0
+    const whole = text.slice(start, start + m[0].length)
+    const paren = m[1] !== undefined
+    const tex = paren ? whole.slice(2, -2) : whole.slice(1, -1)
+    if (!paren && /^[\d.,\s]+$/.test(tex) && !NUMBER.test(tex)) continue
+    out.push({ start, end: start + m[0].length, tex, ...(NUMBER.test(tex) ? { plain: tex } : {}) })
+  }
+  return out
 }

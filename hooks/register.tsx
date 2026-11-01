@@ -5,6 +5,7 @@ import type { Live, Mode } from '../types'
 
 import {
   dvipngColor,
+  escapeMarkdown,
   figureDocument,
   hashKey,
   hasMath,
@@ -21,6 +22,7 @@ import {
   texToUnicode,
 } from './latex'
 import type { Segment } from './latex'
+import { hasInlineMath, inlineTexes, layoutProse } from './flow'
 
 // Pixels per terminal row the formulas are typeset at; the terminal scales
 // the picture to its cells, so this only sets how crisp they are.
@@ -46,11 +48,14 @@ type Settings = {
   preamble: string
   background: string
   live: boolean
+  inline: boolean
+  inlineScale: number
+  inlineBaseline: number
 }
 
 // What the module learns once per load: its options, whether pictures can be
 // drawn, the cache folder, the colors, and every formula and figure typeset so far.
-let settings: Settings = { images: 'auto', color: 'auto', scale: 1.25, cellAspect: 2.1, preamble: '', background: 'auto', live: true }
+let settings: Settings = { images: 'auto', color: 'auto', scale: 1.25, cellAspect: 2.1, preamble: '', background: 'auto', live: true, inline: true, inlineScale: 1, inlineBaseline: 0.8 }
 let canDraw: Promise<boolean> | undefined
 let canDrawFigures: Promise<boolean> | undefined
 let cacheDir: Promise<string> | undefined
@@ -75,6 +80,9 @@ export const register: Register = (on, options) => {
     preamble: String(options.preamble ?? ''),
     background: String(options.background ?? 'auto'),
     live: String(options.preview ?? 'on') !== 'off',
+    inline: String(options.inlineImages ?? 'on') !== 'off',
+    inlineScale: clamp(Number(options.inlineScale) || 1, 0.5, 2),
+    inlineBaseline: clamp(Number(options.inlineBaseline) || 0.8, 0.5, 0.95),
   }
   // What was found for the previous options no longer holds.
   canDraw = canDrawFigures = colors = undefined
@@ -84,7 +92,7 @@ export const register: Register = (on, options) => {
     const composed = await next(e)
     if (!e.surfaces.includes('terminal')) return composed
     const [pictures, figures, { paper }] = await Promise.all([imagesOn($), figuresOn($), palette($)])
-    const section = { id: 'latex-render:style', text: styleGuide({ pictures, figures, paper }), scope: 'session' } as const
+    const section = { id: 'latex-render:style', text: styleGuide({ pictures, figures, paper, inlinePictures: pictures && settings.inline }), scope: 'session' } as const
     return { sections: [...composed.sections, section] }
   })
 
@@ -183,15 +191,24 @@ export const register: Register = (on, options) => {
     const { stable, pending } = splitPending(state.text)
     const segments = splitMath(stable)
     const draws = await imagesOn($)
-    const { Box, Text, Markdown, Image } = $.ui.resolve(e)
+    const els = $.ui.resolve(e)
+    const { Box, Text, Image } = els
     // Each piece with the rows it is expected to take, newest kept when over budget.
     const pieces: { el: JSX.Element; rows: number }[] = []
     let pendingText = ''
+    let keyer = 0
+    const bump = () => update($, live, cur => ({ ...cur, v: cur.v + 1 })).catch(() => undefined)
     const flushText = () => {
       const md = pendingText.replace(/^\s*\n/, '').replace(/\n\s*$/, '')
       if (md.trim() !== '') {
-        const shown = inlineToUnicode(md)
-        pieces.push({ el: <Markdown text={shown} />, rows: estimateRows(shown, room) })
+        const pic = (tex: string) => {
+          const ready = inlineReady.get(inlineId(tex, room))
+          if (!ready && draws && settings.inline) void fitInline($, tex, room).then(p => (p ? bump() : undefined))
+          return ready
+        }
+        const drawn = draws ? drawProse(els, md, pic, () => `l${keyer++}`) : [<els.Markdown text={inlineToUnicode(md)} />]
+        const rows = estimateRows(inlineToUnicode(md), room)
+        drawn.forEach((el, k) => pieces.push({ el, rows: k === 0 ? rows : 0 }))
       }
       pendingText = ''
     }
@@ -258,12 +275,21 @@ export const register: Register = (on, options) => {
       segments.map(s => (s.kind === 'markdown' ? Promise.resolve(undefined) : fit($, s, room))),
     )
 
-    const { Box, Text, Markdown, Image } = $.ui.resolve(e)
+    const els = $.ui.resolve(e)
+    const { Box, Text, Image } = els
+    const prose = segments.filter(s => s.kind === 'markdown').map(s => s.text).join('\n\n')
+    const inlinePics = new Map<string, Picture | undefined>()
+    if (settings.inline) {
+      const texes = [...new Set(inlineTexes(prose))]
+      const fitted = await Promise.all(texes.map(tex => fitInline($, tex, room)))
+      texes.forEach((tex, k) => inlinePics.set(tex, fitted[k]))
+    }
     const children: JSX.Element[] = []
     let pendingText = ''
+    let keyer = 0
     const flushText = () => {
       const md = pendingText.replace(/^\s*\n/, '').replace(/\n\s*$/, '')
-      if (md.trim() !== '') children.push(<Markdown text={inlineToUnicode(md)} />)
+      if (md.trim() !== '') children.push(...drawProse(els, md, tex => inlinePics.get(tex), () => `m${keyer++}`))
       pendingText = ''
     }
 
@@ -353,6 +379,171 @@ function estimateRows(markdown: string, columns: number): number {
 
 function readyPicture(segment: Drawn, room: number): Picture | undefined {
   return ready.get(fitId(segment, room))
+}
+
+
+// Markdown drawn as Claude Code draws it, save that a paragraph, list item,
+// heading or quote holding inline math is laid out as a wrapping row of words,
+// each word still drawn by the engine's Markdown element, each formula an image.
+function drawProse(els: any, md: string, picture: (tex: string) => Picture | undefined, key: () => string): JSX.Element[] {
+  const { Box, Text, Markdown, Image } = els
+  if (!settings.inline || !Image || !hasInlineMath(md)) return [<Markdown text={inlineToUnicode(md)} />]
+  const out: JSX.Element[] = []
+  layoutProse(md).forEach((block, n) => {
+    const marginTop = block.gap && n > 0 ? 1 : 0
+    if (block.kind === 'markdown') {
+      out.push(<Box marginTop={marginTop}><Markdown text={inlineToUnicode(block.text)} /></Box>)
+      return
+    }
+    const words = block.tokens.map(token => {
+      const parts = token.map(part => {
+        if (part.kind === 'md') return <Markdown text={part.text} />
+        const pic = picture(part.tex)
+        const alt = texToUnicode(part.tex) || ' '
+        return pic ? (
+          <Image key={key()} source={{ file: pic.path, format: 'png' }} columns={pic.columns} rows={pic.rows} alt={alt} />
+        ) : (
+          <Markdown text={escapeMarkdown(alt)} />
+        )
+      })
+      return parts.length === 1 ? parts[0]! : <Box flexDirection="row" flexShrink={0}>{parts}</Box>
+    })
+    out.push(
+      <Box flexDirection="row" marginTop={marginTop} marginLeft={block.indent}>
+        {block.marker ? <Box flexShrink={0} marginRight={1}><Text>{block.marker}</Text></Box> : null}
+        {block.quote ? <Box flexShrink={0} marginRight={1}><Text dimColor>▎</Text></Box> : null}
+        <Box flexDirection="row" flexWrap="wrap" columnGap={1} alignItems="flex-start" flexGrow={1} flexShrink={1}>
+          {words}
+        </Box>
+      </Box>,
+    )
+  })
+  return out
+}
+
+// Inline formulas: typeset in text style with their baseline found, then
+// placed in whole cells so the baseline sits where the terminal's text has its own.
+type InlineSet = { path: string; width: number; height: number; above: number; below: number }
+const inlineTypeset = new Map<string, Promise<InlineSet | undefined>>()
+const inlineFitted = new Map<string, Promise<Picture | undefined>>()
+const inlineReady = new Map<string, Picture | undefined>()
+
+function inlineId(tex: string, room: number): string {
+  return `${tex}\u0000${room}`
+}
+
+function fitInline($: EngineInterface, tex: string, room: number): Promise<Picture | undefined> {
+  const id = inlineId(tex, room)
+  let pending = inlineFitted.get(id)
+  if (!pending) {
+    pending = padInline($, tex, room).catch(() => undefined)
+    pending.then(picture => inlineReady.set(id, picture))
+    inlineFitted.set(id, pending)
+  }
+  return pending
+}
+
+function typesetInline($: EngineInterface, tex: string): Promise<InlineSet | undefined> {
+  let pending = inlineTypeset.get(tex)
+  if (!pending) {
+    pending = slot(() => runInlineLatex($, tex)).catch(() => undefined)
+    inlineTypeset.set(tex, pending)
+  }
+  return pending
+}
+
+let running = 0
+const waiting: (() => void)[] = []
+async function slot<T>(job: () => Promise<T>): Promise<T> {
+  if (running >= 6) await new Promise<void>(resolve => waiting.push(resolve))
+  running++
+  try {
+    return await job()
+  } finally {
+    running--
+    waiting.shift()?.()
+  }
+}
+
+async function runInlineLatex($: EngineInterface, tex: string): Promise<InlineSet | undefined> {
+  if (!isSafeTex(tex)) return undefined
+  const dir = await cache($)
+  const { ink } = await palette($)
+  const fg = dvipngColor(ink) ?? 'rgb 0.9 0.9 0.9'
+  const doc = [
+    '\\documentclass[10pt]{article}',
+    '\\usepackage{amsmath,amssymb,amsfonts,mathtools,bm,xcolor}',
+    settings.preamble,
+    `\\definecolor{black}{HTML}{${ink.replace('#', '')}}`,
+    '\\usepackage[active,tightpage]{preview}',
+    '\\begin{document}',
+    `\\begin{preview}\\color{black}$${tex}$\\end{preview}`,
+    '\\end{document}',
+    '',
+  ].join('\n')
+  const dpi = Math.round((0.98 * ROW_PX * settings.inlineScale * 72.27) / 10)
+  const key = hashKey([VERSION, 'inline', doc, fg, dpi].join('\u0000'))
+  const png = `${dir}/${key}.png`
+  const meta = `${dir}/${key}.json`
+  const failed = `${dir}/${key}.err`
+  if (await $.fs.exists(failed)) return undefined
+  if (!(await $.fs.exists(meta))) {
+    await $.fs.write(`${dir}/${key}.tex`, doc)
+    const latex = await $.process.run(
+      ['latex', '-no-shell-escape', '-interaction=nonstopmode', '-halt-on-error', `${key}.tex`],
+      { cwd: dir, env: { openout_any: 'p', openin_any: 'p' }, timeoutMs: 15000 },
+    )
+    if (latex.exitCode !== 0) {
+      await $.fs.write(failed, latexError(latex.stdout))
+      return undefined
+    }
+    const dvipng = await $.process.run(
+      ['dvipng', '-D', String(dpi), '-T', 'tight', '--depth', '--height', '-bg', 'Transparent', '-fg', fg, '-o', `${key}.png`, `${key}.dvi`],
+      { cwd: dir, timeoutMs: 15000 },
+    )
+    await $.process.run(['rm', '-f', `${key}.aux`, `${key}.log`, `${key}.dvi`], { cwd: dir }).catch(() => undefined)
+    const m = /depth=(-?\d+) height=(-?\d+)/.exec(dvipng.stdout)
+    if (dvipng.exitCode !== 0 || !m) {
+      await $.fs.write(failed, dvipng.stderr || 'dvipng failed')
+      return undefined
+    }
+    await $.fs.write(meta, JSON.stringify({ below: Number(m[1]), above: Number(m[2]) }))
+  }
+  const [size, read] = await Promise.all([measure($, png), $.fs.read(meta)])
+  if (!size) return undefined
+  const { above, below } = JSON.parse(read) as { above: number; below: number }
+  return { path: png, width: size.width, height: size.height, above, below }
+}
+
+async function padInline($: EngineInterface, tex: string, room: number): Promise<Picture | undefined> {
+  const t = await typesetInline($, tex)
+  if (!t) return undefined
+  const base = settings.inlineBaseline * ROW_PX
+  const under = ROW_PX - base
+  const cellW = ROW_PX / settings.cellAspect
+  // Shrunk to fit above the baseline and within the line; a little more to stay one row, else the line grows.
+  let shrink = Math.min(1, base / Math.max(1, t.above), (room * cellW) / Math.max(1, t.width))
+  let rows = 1
+  if (t.below * shrink > under) {
+    const oneRow = under / Math.max(1, t.below)
+    if (oneRow >= 0.8 * shrink) shrink = oneRow
+    else rows = 1 + Math.ceil((t.below * shrink - under) / ROW_PX)
+  }
+  const width = Math.max(1, Math.round(t.width * shrink))
+  const height = Math.max(1, Math.round(t.height * shrink))
+  const columns = clamp(Math.ceil(width / cellW), 1, 255)
+  const canvasW = Math.round(columns * cellW)
+  const canvasH = rows * ROW_PX
+  const top = Math.max(0, Math.round(base - t.above * shrink))
+  const dx = Math.max(0, Math.floor((canvasW - width) / 2))
+  const out = t.path.replace(/\.png$/, `-i${columns}x${rows}t${top}w${width}.png`)
+  if (!(await $.fs.exists(out))) {
+    const offset = `${dx > 0 ? `-${dx}` : '+0'}${top > 0 ? `-${top}` : '+0'}`
+    const args = ['magick', t.path, '-resize', `${width}x${height}!`, '-background', 'none', '-gravity', 'northwest', '-extent', `${canvasW}x${canvasH}${offset}`, out]
+    const padded = await $.process.run(args, { timeoutMs: 15000 }).catch(() => undefined)
+    if (padded?.exitCode !== 0) return undefined
+  }
+  return { path: out, columns, rows }
 }
 
 function showMode($: EngineInterface, current: Mode): void {
