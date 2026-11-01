@@ -346,12 +346,16 @@ export const register: Register = (on, options) => {
     if (e.props.plugin !== $.plugin.name || e.surface !== 'terminal') return next(e)
     if (e.props.id === state.id && state.text) {
       await cells($, lastRoom === undefined ? undefined : lastRoom + 4)
-      lastRoom ??= TERM_COLS === undefined ? undefined : Math.max(10, TERM_COLS - 4)
+      lastRoom ??= e.viewport ? roomOf(e.viewport.columns) : TERM_COLS === undefined ? undefined : Math.max(10, TERM_COLS - 4)
       const tree = await drawReply($, e, splitPending(state.text), { wait: false, bullet: true })
       return tree ?? next(e)
     }
     const text = finished[e.props.id]
     if (text === undefined || !e.viewport || (await read($, mode)) === 'source') return next(e)
+    // After a reload nothing is known yet: lay out at the terminal's width, not a
+    // guess, or the row is drawn at another height first and jumps when redone.
+    await cells($, e.viewport.columns)
+    lastRoom = roomOf(e.viewport.columns)
     const tree = await drawReply($, e, text, { wait: true, bullet: true, plain: !hasMath(text), viewRows: e.viewport?.rows, rowKey: `placed\u0000${e.props.id}` })
     return tree ?? next(e)
   }))
