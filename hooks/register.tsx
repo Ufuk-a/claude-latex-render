@@ -132,8 +132,35 @@ async function recordFailure($: EngineInterface, id: string, file: string): Prom
 const ready = new Map<string, Picture | undefined>()
 const typeset = new Map<string, Promise<Typeset | undefined>>()
 const fitted = new Map<string, Promise<Picture | undefined>>()
+// Drawn replies by everything their drawing depends on (see drawReply).
+const drawnTrees = new Map<string, JSX.Element>()
 // The width the last reply was drawn at, so a formula is fitted to it while still streaming.
 let lastRoom: number | undefined
+
+
+// Cumulative time per render hook, written for .claude_scripts/scroll_perf.sh when LATEX_RENDER_PERF is set.
+const perfStats: Record<string, { n: number; ms: number; max: number }> = {}
+let perfOn: Promise<boolean> | undefined
+let perfFlush = 0
+const nowMs = () => (globalThis as any).performance?.now?.() ?? Date.now()
+async function perf<T>($: EngineInterface, name: string, run: () => Promise<T>): Promise<T> {
+  perfOn ??= $.env.get('LATEX_RENDER_PERF').then(v => Boolean(v)).catch(() => false)
+  if (!(await perfOn)) return run()
+  const t = nowMs()
+  try {
+    return await run()
+  } finally {
+    const d = nowMs() - t
+    const st = (perfStats[name] ??= { n: 0, ms: 0, max: 0 })
+    st.n++
+    st.ms += d
+    st.max = Math.max(st.max, d)
+    if (nowMs() - perfFlush > 250) {
+      perfFlush = nowMs()
+      void $.fs.write('/tmp/latex-render-perf.json', JSON.stringify(perfStats)).catch(() => undefined)
+    }
+  }
+}
 
 export const register: Register = (on, options) => {
   settings = {
@@ -253,7 +280,7 @@ export const register: Register = (on, options) => {
 
   // The live row: the held block drawn as the finished block will be; once the
   // block is finished, in fullscreen, the finished block itself.
-  on('ui.render', { component: 'Placed' }, async ($, e, next) => {
+  on('ui.render', { component: 'Placed' }, async ($, e, next) => perf($, 'Placed', async () => {
     const [state, finished] = await Promise.all([read($, live), read($, done)])
     if (e.props.plugin !== $.plugin.name || e.surface !== 'terminal') return next(e)
     if (e.props.id === state.id && state.text) {
@@ -266,9 +293,9 @@ export const register: Register = (on, options) => {
     if (text === undefined || !e.viewport || (await read($, mode)) === 'source') return next(e)
     const tree = await drawReply($, e, text, { wait: true, bullet: true, plain: !hasMath(text) })
     return tree ?? next(e)
-  })
+  }))
 
-  on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
+  on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => perf($, 'AssistantMessage', async () => {
     // Read before anything else, so every reply is drawn again when it changes.
     if ((await read($, mode)) === 'source') return next(e)
     const text = e.props.text
@@ -285,7 +312,7 @@ export const register: Register = (on, options) => {
     lastRoom = Math.max(10, (e.viewport?.columns ?? TERM_COLS ?? 80) - 4)
     const tree = await drawReply($, e, text, { wait: true, bullet: e.props.isFirstOfReply })
     return tree ?? next(e)
-  })
+  }))
 }
 
 // A block of a reply, its formulas and figures as pictures and its prose as
@@ -298,6 +325,14 @@ async function drawReply(
   opts: { wait: boolean; bullet: boolean; plain?: boolean },
 ): Promise<JSX.Element | undefined> {
   const room = lastRoom ?? 76
+  // A finished reply is drawn again on every scroll step (its rows on screen
+  // change); the same inputs give back the same tree object, so neither this
+  // module nor the engine redoes the layout.
+  const memoKey = opts.wait
+    ? [text, room, ROW_PX, cellWidth(), opts.bullet, opts.plain, e.surface, settings.inline, settings.displayAlign, failures.size].join('\u0000')
+    : undefined
+  const memo = memoKey === undefined ? undefined : drawnTrees.get(memoKey)
+  if (memo) return memo
   const segments = opts.plain ? [{ kind: 'markdown' as const, text }] : splitMath(text)
   const els = $.ui.resolve(e)
   const { Box, Text, Image, Markdown } = els as any
@@ -371,7 +406,7 @@ async function drawReply(
   if (children.length === 0) return undefined
   void Markdown
   // The blank row the engine leaves above each message, which a drawing of our own must keep.
-  return (
+  const tree = (
     <Box flexDirection="row" marginTop={1}>
       <Box width={2} flexShrink={0} marginTop={bulletRow}>
         <Text>{opts.bullet ? '●' : ' '}</Text>
@@ -381,6 +416,11 @@ async function drawReply(
       </Box>
     </Box>
   )
+  if (memoKey !== undefined && pictures.every((p, k) => p || segments[k]!.kind === 'markdown' || failures.has(failureId(segments[k]!.kind, (segments[k] as Drawn).tex)))) {
+    if (drawnTrees.size >= 300) drawnTrees.delete(drawnTrees.keys().next().value!)
+    drawnTrees.set(memoKey, tree)
+  }
+  return tree
 }
 
 function drawnIn(text: string): Drawn[] {
@@ -552,8 +592,7 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
       let at = 0
       const row: JSX.Element[] = []
       for (const piece of pieces) {
-        if (piece.x > at) row.push(<Box width={piece.x - at} flexShrink={0} />)
-        row.push(<Box flexShrink={0}>{piece.el}</Box>)
+        row.push(piece.x > at ? <Box flexShrink={0} marginLeft={piece.x - at}>{piece.el}</Box> : <Box flexShrink={0}>{piece.el}</Box>)
         at = Math.max(at, piece.x + piece.width)
       }
       return <Box flexDirection="row" height={1}>{row}</Box>
@@ -610,13 +649,35 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
 
     lines.forEach((tokens, k) => {
       const items: Placed[] = []
+      // Neighbouring words are drawn as one Markdown run: every element is
+      // laid out again on each scroll step, so fewer is faster.
+      let run: { x: number; width: number; text: string } | undefined
+      const endRun = () => {
+        if (!run) return
+        const { x: at, width, text } = run
+        items.push({ x: at, width, up: 0, down: 0, isText: true, cells: row => [[row, <Markdown text={text} />]] })
+        run = undefined
+      }
       let x = left
       for (const token of tokens) {
         for (const { part, width, pic } of token.parts) {
           const at = x
           if (part.kind === 'md') {
-            items.push({ x: at, width, up: 0, down: 0, isText: true, cells: row => [[row, <Markdown text={part.text} />]] })
-          } else if (pic) {
+            if (run && run.x + run.width === at) {
+              run.text += part.text
+              run.width += width
+            } else if (run && run.x + run.width + 1 === at) {
+              run.text += ' ' + part.text
+              run.width += 1 + width
+            } else {
+              endRun()
+              run = { x: at, width, text: part.text }
+            }
+            x += width
+            continue
+          }
+          endRun()
+          if (pic) {
             const up = pic.rowsAbove ?? 0
             const id = key()
             const alt = texToUnicode(part.tex) || ' '
@@ -638,6 +699,7 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
         }
         x += 1
       }
+      endRun()
       group.push({
         items,
         gap: k === 0 && group.length > 0 ? gap : 0,
