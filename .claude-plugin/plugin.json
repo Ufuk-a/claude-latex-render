@@ -1,6 +1,6 @@
 {
   "name": "latex-render",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Renders LaTeX in Claude's replies, live and in place: display and inline math and TikZ figures as crisp images (kitty graphics protocol)",
   "author": {
     "name": "Ufuk-a",
