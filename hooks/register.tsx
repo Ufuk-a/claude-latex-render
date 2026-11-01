@@ -398,26 +398,37 @@ async function prepareLive($: EngineInterface, text: string): Promise<void> {
   )
 }
 
-// The held text without a formula or figure still open at its end, which shows once it closes.
+// The held text without a formula or figure still open at its end, which shows
+// once it closes. Cutting at one opening can leave another open before it (an
+// environment begun inside an inline formula), so it cuts until nothing is open.
 function splitPending(text: string): string {
+  for (;;) {
+    const cut = openAt(text)
+    if (cut === undefined) return text
+    text = text.slice(0, cut)
+  }
+}
+
+function openAt(text: string): number | undefined {
   const opens: number[] = []
-  const dollars = [...text.matchAll(/\$\$/g)].map(m => m.index ?? 0)
+  const dollars = [...text.matchAll(/(?<!\\)\$\$/g)].map(m => m.index ?? 0)
   if (dollars.length % 2 === 1) opens.push(dollars[dollars.length - 1]!)
   const bracket = text.lastIndexOf('\\[')
   if (bracket > text.lastIndexOf('\\]')) opens.push(bracket)
+  const paren = text.lastIndexOf('\\(')
+  if (paren > text.lastIndexOf('\\)')) opens.push(paren)
   const begin = text.lastIndexOf('\\begin{')
   if (begin >= 0) {
     const env = /^\\begin\{([^}]*)\}/.exec(text.slice(begin))?.[1]
-    if (env && !text.slice(begin).includes(`\\end{${env}}`)) opens.push(begin)
+    if (!env || !text.slice(begin).includes(`\\end{${env}}`)) opens.push(begin)
   }
   const fence = [...text.matchAll(/^```/gm)].map(m => m.index ?? 0)
   if (fence.length % 2 === 1 && /^```tikz/.test(text.slice(fence[fence.length - 1]!))) opens.push(fence[fence.length - 1]!)
-  if (opens.length > 0) return text.slice(0, Math.min(...opens))
   // An inline formula still open on the last line waits for its closing dollar.
-  const lastLine = text.slice(text.lastIndexOf('\n') + 1)
-  const singles = [...lastLine.replace(/\$\$/g, '').matchAll(/(?<!\\)\$/g)]
-  if (singles.length % 2 === 1) return text.slice(0, text.length - lastLine.length + lastLine.lastIndexOf('$'))
-  return text
+  const lineStart = text.lastIndexOf('\n') + 1
+  const singles = [...text.slice(lineStart).matchAll(/(?<![\\$])\$(?!\$)/g)].map(m => lineStart + (m.index ?? 0))
+  if (singles.length % 2 === 1) opens.push(singles[singles.length - 1]!)
+  return opens.length > 0 ? Math.min(...opens) : undefined
 }
 
 
