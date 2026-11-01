@@ -54,7 +54,7 @@
     "preview": {
       "type": "string",
       "title": "Live preview",
-      "description": "on: while Claude writes, each formula and figure is shown above the prompt as soon as it is typeset; off: only in the reply, once its block ends",
+      "description": "on: while Claude writes, text from the first math on is held back and drawn typeset right under the reply, so raw LaTeX never shows; off: the reply streams raw and is typeset when its block ends",
       "options": [
         "on",
         "off"

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Mode, Previewed } from '../types'
+import type { Live, Mode } from '../types'
 
 import {
   dvipngColor,
@@ -26,8 +26,10 @@ import type { Segment } from './latex'
 // the picture to its cells, so this only sets how crisp they are.
 const ROW_PX = 40
 const VERSION = 1
-// The most rows the preview above the prompt takes.
-const PREVIEW_ROWS = 12
+// The most rows the live band above the prompt takes.
+const LIVE_ROWS = 40
+// What can open math, a figure or a LaTeX environment: the held part of a block starts at its line.
+const MATH_OPENER = /\$|\\[\[(]|\\begin\{|```tikz/
 
 type Display = Segment & { kind: 'display' }
 type Figure = Segment & { kind: 'figure' }
@@ -43,22 +45,22 @@ type Settings = {
   cellAspect: number
   preamble: string
   background: string
-  preview: boolean
+  live: boolean
 }
 
 // What the module learns once per load: its options, whether pictures can be
 // drawn, the cache folder, the colors, and every formula and figure typeset so far.
-let settings: Settings = { images: 'auto', color: 'auto', scale: 1.25, cellAspect: 2.1, preamble: '', background: 'auto', preview: true }
+let settings: Settings = { images: 'auto', color: 'auto', scale: 1.25, cellAspect: 2.1, preamble: '', background: 'auto', live: true }
 let canDraw: Promise<boolean> | undefined
 let canDrawFigures: Promise<boolean> | undefined
 let cacheDir: Promise<string> | undefined
 let colors: Promise<Palette> | undefined
 // `/latex` flips this; in `source` every reply is drawn as written.
 const mode = atom({ plugin: 'latex-render', key: 'mode' } as const, 'render' as Mode)
-// The formulas and figures of the block being streamed, shown above the prompt until it ends.
-const preview = atom({ plugin: 'latex-render', key: 'preview' } as const, [] as Previewed[])
-// Counts the blocks the preview has been cleared for, so a picture typeset late is not shown under the next.
-let previewed = 0
+// The part of the block being streamed that is held back, drawn above the prompt until it ends.
+const live = atom({ plugin: 'latex-render', key: 'live' } as const, { text: '', bullet: false, v: 0 } as Live)
+// Pictures already fitted, by fitId, so the band draws without waiting on TeX.
+const ready = new Map<string, Picture | undefined>()
 const typeset = new Map<string, Promise<Typeset | undefined>>()
 const fitted = new Map<string, Promise<Picture | undefined>>()
 // The width the last reply was drawn at, so a formula is fitted to it while still streaming.
@@ -72,7 +74,7 @@ export const register: Register = (on, options) => {
     cellAspect: clamp(Number(options.cellAspect) || 2.1, 1, 4),
     preamble: String(options.preamble ?? ''),
     background: String(options.background ?? 'auto'),
-    preview: String(options.preview ?? 'on') !== 'off',
+    live: String(options.preview ?? 'on') !== 'off',
   }
   // What was found for the previous options no longer holds.
   canDraw = canDrawFigures = colors = undefined
@@ -106,94 +108,130 @@ export const register: Register = (on, options) => {
     return { text: chosen === 'source' ? 'LaTeX is shown as written.' : 'LaTeX is rendered.' }
   })
 
-  // While a reply streams, each display formula and figure is typeset as
-  // soon as it closes and shown above the prompt, its picture then ready, or
-  // nearly, when the block ends and is drawn. The chunks pass on unchanged.
+  // While a reply streams, its text from the first character that could open
+  // math is held back from the engine until just before the block's end, so
+  // raw LaTeX never shows in the streaming row. The held text is drawn live,
+  // typeset, in the band above the prompt, right under the reply it continues;
+  // at the block's end it is released whole (the transcript keeps the same
+  // text) and the engine draws the finished block in place.
   on('turn.step', async function* ($, e, next) {
     const onTerminal = e.agentId === undefined && (await $.session.surfaces()).includes('terminal')
-    if (!onTerminal || (await read($, mode)) === 'source' || !(await imagesOn($))) return yield* next(e)
-    let block: number | undefined // the index of the text block being written
-    let text = '' // its text so far
-    let settled = 0 // how much of it has been handed to the typesetter
-    let isShowing = false // the preview may hold this block's pictures
-    // The block's row is drawn when it ends, so its preview goes.
-    const endPreview = () => {
-      if (!isShowing) return
-      isShowing = false
-      previewed += 1
-      void update($, preview, () => []).catch(() => undefined)
+    if (!onTerminal || !settings.live || (await read($, mode)) === 'source') return yield* next(e)
+    let held: { first: any; text: string; index: number; bullet: boolean } | undefined
+    let streamedIn = new Map<number, number>() // characters passed through per block
+    let settled = 0
+    const release = function* () {
+      if (!held) return
+      const chunk = { ...held.first, text: held.text }
+      held = undefined
+      settled = 0
+      yield chunk
+      void update($, live, () => ({ text: '', bullet: false, v: 0 })).catch(() => undefined)
     }
-
     try {
       for await (const chunk of next(e)) {
-        yield chunk
         if (chunk.kind !== 'text') {
-          endPreview()
+          yield* release()
+          yield chunk
           continue
         }
-        if (chunk.index !== block) {
-          endPreview()
-          block = chunk.index
-          text = ''
-          settled = 0
+        if (held && held.index !== chunk.index) yield* release()
+        if (!held) {
+          const at = chunk.text.search(MATH_OPENER)
+          if (at < 0) {
+            streamedIn.set(chunk.index, (streamedIn.get(chunk.index) ?? 0) + chunk.text.length)
+            yield chunk
+            continue
+          }
+          // Cut back to the start of the line, so a sentence is never split between the row and the band.
+          const before = chunk.text.slice(0, at)
+          const nl = before.lastIndexOf('\n')
+          const cut = nl >= 0 ? nl + 1 : (streamedIn.get(chunk.index) ?? 0) === 0 ? 0 : at
+          if (cut > 0) {
+            streamedIn.set(chunk.index, (streamedIn.get(chunk.index) ?? 0) + cut)
+            yield { ...chunk, text: chunk.text.slice(0, cut) }
+          }
+          held = { first: cut > 0 ? { kind: 'text', index: chunk.index } : chunk, text: chunk.text.slice(cut), index: chunk.index, bullet: (streamedIn.get(chunk.index) ?? 0) === 0 }
+        } else {
+          held.text += chunk.text
         }
-        text += chunk.text
+        const text = held.text
         const upTo = settledLength(text)
         if (upTo > settled) {
-          const piece = text.slice(settled, upTo)
-          void prepare($, piece)
-          if (settings.preview) {
-            isShowing = true
-            void showPreview($, piece, previewed)
-          }
+          void prepareLive($, text.slice(settled, upTo))
           settled = upTo
         }
+        const bullet = held.bullet
+        void update($, live, cur => ({ text, bullet, v: cur.v + 1 })).catch(() => undefined)
       }
-    } finally {
-      endPreview()
+    } catch (err) {
+      // An interrupted stream still records the text it held.
+      yield* release()
+      throw err
     }
+    yield* release()
   })
 
-  // Above the prompt, while Claude writes: the newest formulas and figures of
-  // the block it is writing, as many as the band has rows for.
+  // Above the prompt, while Claude writes: the held part of the block being
+  // written, drawn as the finished block will be, its newest rows when it is long.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    // Both read first, so the band is drawn again when either changes.
-    const [items, current] = await Promise.all([read($, preview), read($, mode)])
-    const { hasSurvey, isWorking, maxRows, bodyColumns, view } = e.props
-    // A strip, not a page: outside fullscreen `maxRows` is the terminal's height. A row goes to the heading.
-    const budget = Math.min(maxRows, PREVIEW_ROWS) - 1
-    const isQuiet = items.length === 0 || current === 'source' || hasSurvey || !isWorking || view.agentId !== undefined
-    if (isQuiet || e.surface !== 'terminal' || budget < 1) return next(e)
-
-    const room = Math.max(10, bodyColumns - 2)
-    const pictures = await Promise.all(items.map(item => fit($, item, room, budget)))
-    const shown: { item: Previewed; picture: Picture; index: number }[] = []
+    const [state, current] = await Promise.all([read($, live), read($, mode)])
+    const { hasSurvey, maxRows, bodyColumns, view } = e.props
+    const budget = Math.min(maxRows - 2, LIVE_ROWS)
+    if (!state.text || current === 'source' || hasSurvey || view.agentId !== undefined || e.surface !== 'terminal' || budget < 2) return next(e)
+    const room = lastRoom ?? Math.max(10, bodyColumns - 4)
+    const { stable, pending } = splitPending(state.text)
+    const segments = splitMath(stable)
+    const draws = await imagesOn($)
+    const { Box, Text, Markdown, Image } = $.ui.resolve(e)
+    // Each piece with the rows it is expected to take, newest kept when over budget.
+    const pieces: { el: JSX.Element; rows: number }[] = []
+    let pendingText = ''
+    const flushText = () => {
+      const md = pendingText.replace(/^\s*\n/, '').replace(/\n\s*$/, '')
+      if (md.trim() !== '') {
+        const shown = inlineToUnicode(md)
+        pieces.push({ el: <Markdown text={shown} />, rows: estimateRows(shown, room) })
+      }
+      pendingText = ''
+    }
+    segments.forEach((s, index) => {
+      if (s.kind === 'markdown') { pendingText += s.text; return }
+      const picture = draws ? readyPicture(s, room) : undefined
+      if (!picture) {
+        if (draws) void fit($, s, room).then(() => update($, live, cur => ({ ...cur, v: cur.v + 1 }))).catch(() => undefined)
+        pendingText += segmentsToUnicode([s])
+        return
+      }
+      flushText()
+      pieces.push({
+        el: (
+          <Box marginLeft={2}>
+            <Image key={`live-${index}`} source={{ file: picture.path, format: 'png' }} columns={picture.columns} rows={picture.rows} alt={s.kind === 'figure' ? 'TikZ figure' : texToUnicode(s.tex) || ' '} />
+          </Box>
+        ),
+        rows: picture.rows,
+      })
+    })
+    flushText()
+    if (pending) pieces.push({ el: <Box marginLeft={2}><Text dimColor>{pending}</Text></Box>, rows: 1 })
     let left = budget
-    for (let index = items.length - 1; index >= 0; index--) {
-      const item = items[index]
-      const picture = pictures[index]
-      if (!item || !picture) continue
-      if (picture.rows > left) break
-      shown.unshift({ item, picture, index })
-      left -= picture.rows
+    const shown: JSX.Element[] = []
+    for (let i = pieces.length - 1; i >= 0; i--) {
+      const piece = pieces[i]!
+      if (piece.rows > left && shown.length > 0) break
+      shown.unshift(piece.el)
+      left -= piece.rows
     }
     if (shown.length === 0) return next(e)
-
-    const { Box, Text, Image } = $.ui.resolve(e)
     return (
-      <Box flexDirection="column">
-        <Text dimColor>LaTeX preview</Text>
-        {shown.map(({ item, picture, index }) => (
-          <Box marginLeft={2}>
-            <Image
-              key={`preview-${index}`}
-              source={{ file: picture.path, format: 'png' }}
-              columns={picture.columns}
-              rows={picture.rows}
-              alt={item.kind === 'figure' ? 'TikZ figure' : texToUnicode(item.tex) || ' '}
-            />
-          </Box>
-        ))}
+      <Box flexDirection="row">
+        <Box width={2} flexShrink={0}>
+          <Text>{state.bullet ? '●' : ' '}</Text>
+        </Box>
+        <Box flexDirection="column" flexGrow={1}>
+          {shown}
+        </Box>
       </Box>
     )
   })
@@ -269,25 +307,52 @@ function drawnIn(text: string): Drawn[] {
   return splitMath(text).filter((s): s is Drawn => s.kind !== 'markdown')
 }
 
-// Typesets the formulas and figures in a piece of a reply ahead of its drawing.
-function prepare($: EngineInterface, text: string): Promise<unknown> {
-  return Promise.all(drawnIn(text).map(s => (lastRoom === undefined ? typesetSegment($, s) : fit($, s, lastRoom))))
+// Typesets the formulas and figures that closed in a held piece, redrawing the band as each is ready.
+async function prepareLive($: EngineInterface, text: string): Promise<void> {
+  await Promise.all(
+    drawnIn(text).map(async seg => {
+      if (lastRoom !== undefined) await fit($, seg, lastRoom)
+      else await typesetSegment($, seg)
+      await update($, live, cur => ({ ...cur, v: cur.v + 1 })).catch(() => undefined)
+    }),
+  )
 }
 
-// Adds each formula and figure in a piece of a reply to the preview once it is
-// typeset, in order, unless the block it belongs to has ended by then.
-async function showPreview($: EngineInterface, text: string, block: number): Promise<void> {
-  for (const segment of drawnIn(text)) {
-    const done = await typesetSegment($, segment)
-    if (!done || block !== previewed) continue
-    const item: Previewed =
-      segment.kind === 'figure'
-        ? { kind: 'figure', tex: segment.tex }
-        : segment.env
-          ? { kind: 'display', tex: segment.tex, env: segment.env }
-          : { kind: 'display', tex: segment.tex }
-    await update($, preview, items => [...items, item].slice(-8)).catch(() => undefined)
+// The held text's typesettable part, and a placeholder for a formula or figure still open at its end.
+function splitPending(text: string): { stable: string; pending?: string } {
+  const opens: number[] = []
+  const dollars = [...text.matchAll(/\$\$/g)].map(m => m.index ?? 0)
+  if (dollars.length % 2 === 1) opens.push(dollars[dollars.length - 1]!)
+  const bracket = text.lastIndexOf('\\[')
+  if (bracket > text.lastIndexOf('\\]')) opens.push(bracket)
+  const begin = text.lastIndexOf('\\begin{')
+  if (begin >= 0) {
+    const env = /^\\begin\{([^}]*)\}/.exec(text.slice(begin))?.[1]
+    if (env && !text.slice(begin).includes(`\\end{${env}}`)) opens.push(begin)
   }
+  const fence = [...text.matchAll(/^```/gm)].map(m => m.index ?? 0)
+  if (fence.length % 2 === 1 && /^```tikz/.test(text.slice(fence[fence.length - 1]!))) opens.push(fence[fence.length - 1]!)
+  if (opens.length > 0) {
+    const at = Math.min(...opens)
+    const kind = text.slice(at).startsWith('```') || text.slice(at).includes('tikzpicture') ? 'figure' : 'formula'
+    return { stable: text.slice(0, at), pending: `⋯ ${kind}` }
+  }
+  // An inline formula still open on the last line is left for the next piece.
+  const lastLine = text.slice(text.lastIndexOf('\n') + 1)
+  const singles = [...lastLine.replace(/\$\$/g, '').matchAll(/(?<!\\)\$/g)]
+  if (singles.length % 2 === 1) {
+    const cut = text.length - lastLine.length + lastLine.lastIndexOf('$')
+    return { stable: text.slice(0, cut) }
+  }
+  return { stable: text }
+}
+
+function estimateRows(markdown: string, columns: number): number {
+  return markdown.split('\n').reduce((n, line) => n + Math.max(1, Math.ceil(line.length / Math.max(10, columns))), 0)
+}
+
+function readyPicture(segment: Drawn, room: number): Picture | undefined {
+  return ready.get(fitId(segment, room))
 }
 
 function showMode($: EngineInterface, current: Mode): void {
@@ -456,11 +521,16 @@ async function runTikz($: EngineInterface, segment: Figure): Promise<Typeset | u
 // Pads (and if needed shrinks) a typeset formula or figure to a whole number
 // of cells, so the terminal's scaling to the box keeps its proportions.
 // Within `room` columns and, when given, `rowLimit` rows.
+function fitId(segment: Drawn, room: number, rowLimit?: number): string {
+  return `${segment.kind === 'figure' ? 'figure' : segment.env}\u0000${segment.tex}\u0000${room}\u0000${rowLimit ?? ''}`
+}
+
 function fit($: EngineInterface, segment: Drawn, room: number, rowLimit?: number): Promise<Picture | undefined> {
-  const id = `${segment.kind === 'figure' ? 'figure' : segment.env}\u0000${segment.tex}\u0000${room}\u0000${rowLimit ?? ''}`
+  const id = fitId(segment, room, rowLimit)
   let pending = fitted.get(id)
   if (!pending) {
     pending = padToCells($, segment, room, rowLimit).catch(() => undefined)
+    pending.then(picture => ready.set(id, picture))
     fitted.set(id, pending)
   }
   return pending
