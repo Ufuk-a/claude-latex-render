@@ -132,6 +132,14 @@ async function recordFailure($: EngineInterface, id: string, file: string): Prom
 const ready = new Map<string, Picture | undefined>()
 const typeset = new Map<string, Promise<Typeset | undefined>>()
 const fitted = new Map<string, Promise<Picture | undefined>>()
+// Everything a reply's layout depends on.
+function layoutKey(text: string, room: number, bullet: boolean, plain: boolean | undefined, surface: string): string {
+  return [text, room, ROW_PX, cellWidth(), bullet, plain, surface, settings.inline, settings.displayAlign, failures.size].join('\u0000')
+}
+// The mode and the finished blocks as last read, for the render hooks' fast path.
+let modeNow: Mode | undefined
+const doneById = new Map<string, string>()
+const doneTexts = new Set<string>()
 // Laid-out replies by everything their layout depends on (see drawReply), and
 // their trees by layout and window.
 const drawnLayouts = new Map<string, Layout>()
@@ -198,7 +206,8 @@ export const register: Register = (on, options) => {
       immediate: true,
     })
     // A reload keeps the mode; the status line has to say so again.
-    showMode($, await read($, mode))
+    modeNow = await read($, mode)
+    showMode($, modeNow)
     return next(e)
   })
 
@@ -206,6 +215,9 @@ export const register: Register = (on, options) => {
     const chosen = nextMode(await read($, mode), e.args)
     if (!chosen) return { text: 'Usage: /latex [render|source]' }
     await update($, mode, () => chosen)
+    modeNow = chosen
+    // Replies drawn by the fast path read no atom, so they are asked again here.
+    $.ui.invalidate('ui.render')
     showMode($, chosen)
     return { text: chosen === 'source' ? 'LaTeX is shown as written.' : 'LaTeX is rendered.' }
   })
@@ -233,6 +245,8 @@ export const register: Register = (on, options) => {
         // Everything in the block is typeset before the engine draws it, so the
         // finished message comes out at its final height and nothing moves after.
         await Promise.race([readyAll($, block.text), $.clock.sleep(3000)]).catch(() => undefined)
+        doneById.set(block.id, block.text)
+        doneTexts.add(block.text)
         await update($, done, d => ({ ...d, [block.id]: block.text })).catch(() => undefined)
         yield* block.before
         yield { ...(block.first as object), text: block.text } as Chunk<'turn.step'>
@@ -283,7 +297,16 @@ export const register: Register = (on, options) => {
   // The live row: the held block drawn as the finished block will be; once the
   // block is finished, in fullscreen, the finished block itself.
   on('ui.render', { component: 'Placed' }, async ($, e, next) => perf($, 'Placed', async () => {
+    if (e.props.plugin === $.plugin.name && e.surface === 'terminal' && modeNow === 'render' && e.viewport && lastRoom !== undefined) {
+      const text = doneById.get(e.props.id)
+      const layout = text === undefined ? undefined : drawnLayouts.get(layoutKey(text, lastRoom, true, !hasMath(text), e.surface))
+      if (layout) return windowed(layout, layoutKey(text!, lastRoom, true, !hasMath(text!), e.surface), e.props.onScreen, e.viewport.rows)
+    }
     const [state, finished] = await Promise.all([read($, live), read($, done)])
+    for (const [id, t] of Object.entries(finished)) {
+      doneById.set(id, t)
+      doneTexts.add(t)
+    }
     if (e.props.plugin !== $.plugin.name || e.surface !== 'terminal') return next(e)
     if (e.props.id === state.id && state.text) {
       await cells($, lastRoom === undefined ? undefined : lastRoom + 4)
@@ -298,10 +321,28 @@ export const register: Register = (on, options) => {
   }))
 
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => perf($, 'AssistantMessage', async () => {
+    // The fast path: a reply already laid out comes back at once. The engine
+    // asks again on every scroll step and drops an answer still in flight when
+    // the next ask comes, so a round trip here would leave rows undrawn.
+    if (modeNow === 'render' && e.surface === 'terminal' && e.viewport && !e.props.isSummary) {
+      const text = e.props.text
+      if (doneTexts.has(text)) {
+        const { Box } = $.ui.resolve(e) as any
+        return <Box />
+      }
+      if (!hasMath(text)) return next(e)
+      const room = Math.max(10, e.viewport.columns - 4)
+      const key = layoutKey(text, room, e.props.isFirstOfReply, undefined, e.surface)
+      const layout = room === lastRoom ? drawnLayouts.get(key) : undefined
+      if (layout) return windowed(layout, key, e.props.onScreen, e.viewport.rows)
+    }
     // Read before anything else, so every reply is drawn again when it changes.
-    if ((await read($, mode)) === 'source') return next(e)
+    modeNow = await read($, mode)
+    if (modeNow === 'source') return next(e)
     const text = e.props.text
-    if (e.surface === 'terminal' && e.viewport && !e.props.isSummary && Object.values(await read($, done)).includes(text)) {
+    const finished = Object.values(await read($, done))
+    finished.forEach(t => doneTexts.add(t))
+    if (e.surface === 'terminal' && e.viewport && !e.props.isSummary && finished.includes(text)) {
       const { Box } = $.ui.resolve(e) as any
       return <Box />
     }
@@ -329,9 +370,7 @@ async function drawReply(
   const room = lastRoom ?? 76
   // A finished reply is laid out once: the engine draws it again on every
   // scroll step that moves it, and only its window changes then.
-  const memoKey = opts.wait
-    ? [text, room, ROW_PX, cellWidth(), opts.bullet, opts.plain, e.surface, settings.inline, settings.displayAlign, failures.size].join('\u0000')
-    : undefined
+  const memoKey = opts.wait ? layoutKey(text, room, opts.bullet, opts.plain, e.surface) : undefined
   const memo = memoKey === undefined ? undefined : drawnLayouts.get(memoKey)
   if (memo) return windowed(memo, memoKey!, opts.onScreen, opts.viewRows)
   const segments = opts.plain ? [{ kind: 'markdown' as const, text }] : splitMath(text)
@@ -430,25 +469,38 @@ function guessRows(md: string, width: number): number {
   return md.split('\n').reduce((n, line) => n + Math.max(1, Math.ceil(textWidth(line) / Math.max(10, width))), 0)
 }
 
-// A window keeps half a viewport drawn beyond the rows in view on either side,
-// so a fast flick does not outrun the redraw, and snaps to WINDOW_STEP rows, so
-// most scroll steps hand back a tree already built.
-const WINDOW_STEP = 16
-const lastWindow = new Map<string, string>()
+// Where a reply was last seen on screen and how fast its rows were moving
+// (rows per millisecond, positive scrolling down), by layout.
+const motion = new Map<string, { first: number; at: number; speed: number; span: string }>()
+// Rows drawn beyond the viewport: some behind the scroll (a reversal starts
+// there), more ahead of it, and ahead as many more as the scroll covers in
+// LOOKAHEAD_MS, so a flick lands on rows already drawn. Windows snap to
+// WINDOW_STEP rows.
+const BEHIND = 20
+const AHEAD = 16
+const LOOKAHEAD_MS = 400
+const WINDOW_STEP = 8
 
 // The reply drawn for where it is on screen: in full where the surface does not
-// say; around the rows in view (a viewport's height either side) where it does;
-// as last drawn while off screen, where the terminal holds it anyway.
+// say; around the rows in view where it does; as last drawn while off screen,
+// where the terminal holds it anyway.
 function windowed(layout: Layout, memoKey: string, onScreen: { first: number; last: number } | null | undefined, viewRows?: number): JSX.Element {
   if (onScreen === undefined) return cachedTree(layout, memoKey, undefined)
-  let span = onScreen === null ? lastWindow.get(memoKey) : undefined
-  if (onScreen) {
-    const margin = Math.max(24, Math.round((viewRows ?? 48) / 2))
-    const lo = Math.max(0, Math.floor((onScreen.first - margin) / WINDOW_STEP) * WINDOW_STEP)
-    const hi = Math.ceil((onScreen.last + 1 + margin) / WINDOW_STEP) * WINDOW_STEP
-    span = `${lo},${hi}`
-    lastWindow.set(memoKey, span)
+  const seen = motion.get(memoKey)
+  if (onScreen === null) return cachedTree(layout, memoKey, seen?.span)
+  const now = Date.now()
+  let speed = 0
+  if (seen && now - seen.at < 500) {
+    const moved = (onScreen.first - seen.first) / Math.max(1, now - seen.at)
+    // A reversal takes the new direction at once; otherwise the speed is smoothed.
+    speed = moved * seen.speed < 0 ? moved : 0.5 * seen.speed + 0.5 * moved
   }
+  const lead = Math.min(3 * (viewRows ?? 48), Math.abs(speed) * LOOKAHEAD_MS)
+  const down = speed >= 0
+  const lo = Math.max(0, Math.floor((onScreen.first - (down ? BEHIND : AHEAD + lead)) / WINDOW_STEP) * WINDOW_STEP)
+  const hi = Math.ceil((onScreen.last + 1 + (down ? AHEAD + lead : BEHIND)) / WINDOW_STEP) * WINDOW_STEP
+  const span = `${lo},${hi}`
+  motion.set(memoKey, { first: onScreen.first, at: now, speed, span })
   return cachedTree(layout, memoKey, span)
 }
 
@@ -621,7 +673,7 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
     return [{ el: <Markdown text={flat} />, guess: guessRows(flat, room) }]
   }
   const out: Part[] = []
-  type Placed = { x: number; width: number; cells: (row: number) => [number, JSX.Element][]; up: number; down: number; isText: boolean }
+  type Placed = { x: number; width: number; cells: (row: number) => [number, JSX.Element][]; up: number; down: number; isText: boolean; plain?: string }
   type Line = { items: Placed[]; gap: number; starts: boolean; heading: boolean; marker?: { x: number; text: string }; quote?: number }
   let group: Line[] = []
   let overhang = 0
@@ -684,20 +736,39 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
     // Laid out row by row in the normal flow (no absolute positions, which do
     // not clip when scrolled): each row holds its pieces left to right, a
     // formula taller than a row contributing one strip to each row it covers.
-    const grid: { x: number; width: number; el: JSX.Element }[][] = Array.from({ length: height }, () => [])
+    const grid: { x: number; width: number; el: JSX.Element; plain?: string; bare?: boolean }[][] = Array.from({ length: height }, () => [])
     for (const { line, row } of placed) {
-      if (line.marker) grid[row]!.push({ x: line.marker.x, width: textWidth(line.marker.text), el: <Text>{line.marker.text}</Text> })
+      if (line.marker) grid[row]!.push({ x: line.marker.x, width: textWidth(line.marker.text), el: <Text>{line.marker.text}</Text>, plain: line.marker.text })
       if (line.quote !== undefined) grid[row]!.push({ x: line.quote, width: 1, el: <Text dimColor>▎</Text> })
-      for (const item of line.items) item.cells(row).forEach(([r, el]) => grid[r]?.push({ x: item.x, width: item.width, el }))
+      for (const item of line.items) item.cells(row).forEach(([r, el]) => grid[r]?.push({ x: item.x, width: item.width, el, ...(r === row && item.plain !== undefined ? { plain: item.plain } : {}), ...(item.isText ? {} : { bare: true }) }))
     }
+    // Each row as few elements as it can be: plain words and the gaps before
+    // them are one Text; a formula or styled run keeps a box for its gap.
     const children = grid.map(pieces => {
       pieces.sort((p, q) => p.x - q.x)
       let at = 0
+      let words = ''
       const row: JSX.Element[] = []
+      const endWords = () => {
+        if (words) row.push(<Text>{words}</Text>)
+        words = ''
+      }
       for (const piece of pieces) {
-        row.push(piece.x > at ? <Box flexShrink={0} marginLeft={piece.x - at}>{piece.el}</Box> : <Box flexShrink={0}>{piece.el}</Box>)
+        const gap = Math.max(0, piece.x - at)
+        if (piece.plain !== undefined) {
+          words += ' '.repeat(gap) + piece.plain
+        } else if (piece.bare) {
+          // A picture holds its own size: its gap joins the words before it.
+          words += ' '.repeat(gap)
+          endWords()
+          row.push(piece.el)
+        } else {
+          endWords()
+          row.push(gap > 0 ? <Box flexShrink={0} marginLeft={gap}>{piece.el}</Box> : <Box flexShrink={0}>{piece.el}</Box>)
+        }
         at = Math.max(at, piece.x + piece.width)
       }
+      endWords()
       return <Box flexDirection="row" height={1}>{row}</Box>
     })
     // Rows the first line's formulas reach above its text count toward the gap before the canvas.
@@ -760,7 +831,9 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
       const endRun = () => {
         if (!run) return
         const { x: at, width, text } = run
-        items.push({ x: at, width, up: 0, down: 0, isText: true, cells: row => [[row, <Markdown text={text} />]] })
+        // Words with no markdown in them are plain text, folded into their row's one Text.
+        const plain = /[\\*_`~\[\]<>|]/.test(text) ? undefined : text
+        items.push({ x: at, width, up: 0, down: 0, isText: true, plain, cells: row => [[row, <Markdown text={text} />]] })
         run = undefined
       }
       let x = left

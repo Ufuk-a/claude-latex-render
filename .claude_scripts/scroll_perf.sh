@@ -61,6 +61,8 @@ if [[ -n "${SHOTS:-}" ]]; then
   log "shots in $OUT/shots-${TAG:-x}"
   exit 0
 fi
+# VIDEO=1: record the scroll at 30 fps (for blank_frames.py).
+[[ -n "${VIDEO:-}" ]] && { ffmpeg -loglevel error -y -f x11grab -draw_mouse 0 -framerate 30 -video_size ${W}x${H} -i $DISP -c:v libx264 -preset ultrafast -crf 10 "$OUT/scroll-${TAG:-x}.mp4" & ff=$!; sleep 0.5; }
 c0=$(ticks "$cl"); g0=$(ticks "$gh"); t0=$(date +%s.%N)
 cp /tmp/latex-render-perf.json "$OUT/perf0.json" 2>/dev/null || echo '{}' > "$OUT/perf0.json"
 for _ in 1 2; do
@@ -69,6 +71,7 @@ for _ in 1 2; do
 done
 sleep 3
 c1=$(ticks "$cl"); g1=$(ticks "$gh"); t1=$(date +%s.%N)
+[[ -n "${VIDEO:-}" ]] && { kill -INT $ff; wait $ff 2>/dev/null; }
 import -window root "$OUT/after.png" 2>/dev/null
 cp /tmp/latex-render-perf.json "$OUT/perf1.json" 2>/dev/null || echo '{}' > "$OUT/perf1.json"
 kill "$gh" 2>/dev/null; sleep 0.5; kill "$xv" 2>/dev/null
