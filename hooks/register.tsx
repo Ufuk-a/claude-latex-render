@@ -245,9 +245,13 @@ async function drawReply(
   const children: JSX.Element[] = []
   let pendingText = ''
   let keyer = 0
+  let bulletRow = 0
   const flushText = () => {
     const md = pendingText.replace(/^\s*\n/, '').replace(/\n\s*$/, '')
-    if (md.trim() !== '') children.push(...drawProse(els, md, tex => inlinePics.get(tex), () => `p${keyer++}`))
+    if (md.trim() === '') return void (pendingText = '')
+    const drawn = drawProse(els, md, tex => inlinePics.get(tex), () => `p${keyer++}`)
+    if (children.length === 0) bulletRow = firstRow
+    children.push(...drawn)
     pendingText = ''
   }
   segments.forEach((s, index) => {
@@ -277,7 +281,7 @@ async function drawReply(
   void Markdown
   return (
     <Box flexDirection="row">
-      <Box width={2} flexShrink={0}>
+      <Box width={2} flexShrink={0} marginTop={bulletRow}>
         <Text>{opts.bullet ? '●' : ' '}</Text>
       </Box>
       <Box flexDirection="column" flexGrow={1}>
@@ -337,24 +341,77 @@ function readyPicture(segment: Drawn, room: number): Picture | undefined {
 }
 
 
-// Markdown drawn as Claude Code draws it, save that a paragraph, list item,
-// heading or quote holding inline math is laid out as a wrapping row of words,
-// each word still drawn by the engine's Markdown element, each formula an image.
+// Markdown drawn as Claude Code draws it, save that paragraphs, list items,
+// headings and quotes holding inline math are set here: broken into lines,
+// then packed onto a canvas of cells, each line as high as it fits. A line's
+// text keeps one row below the last (two across a paragraph break); its
+// formulas reach into rows above and below wherever those cells are free, so
+// a tall formula uses the blank space around it instead of spacing out lines.
+// Every word is still drawn by the engine's Markdown element.
+// The row the first drawn line of text sits on, for the reply's bullet.
+let firstRow = 0
 function drawProse(els: any, md: string, picture: (tex: string) => Picture | undefined, key: () => string): JSX.Element[] {
   const { Box, Text, Markdown, Image } = els
   if (!settings.inline || !Image || !hasInlineMath(md)) return [<Markdown text={inlineToUnicode(md)} />]
   const out: JSX.Element[] = []
+  const room = lastRoom ?? 76
+  type Placed = { x: number; width: number; el: (top: number) => JSX.Element; up: number; down: number; isText: boolean }
+  type Line = { items: Placed[]; gap: number; marker?: { x: number; text: string }; quote?: number }
+  let group: Line[] = []
+  firstRow = 0
+
+  const flushGroup = (marginTop: number) => {
+    if (group.length === 0) return
+    // Rows each cell is taken in, as column ranges.
+    const taken = new Map<number, [number, number][]>()
+    const free = (row: number, x0: number, x1: number) => !(taken.get(row) ?? []).some(([a, b]) => x0 < b && a < x1)
+    const take = (row: number, x0: number, x1: number) => taken.set(row, [...(taken.get(row) ?? []), [x0, x1]])
+    const placed: { line: Line; row: number }[] = []
+    let last = -1
+    for (const line of group) {
+      const up = Math.max(0, ...line.items.map(i => i.up))
+      const texts = line.items.filter(i => i.isText || i.up + i.down === 0)
+      const textFrom = Math.min(...line.items.map(i => i.x), line.marker?.x ?? Infinity, line.quote ?? Infinity)
+      const textTo = Math.max(...line.items.map(i => i.x + i.width))
+      const fits = (row: number) =>
+        row - up >= 0 &&
+        free(row, textFrom, textTo) &&
+        line.items.every(i => {
+          for (let r = row - i.up; r <= row + i.down; r++) if (r !== row && !free(r, i.x, i.x + i.width)) return false
+          return true
+        })
+      let row = Math.max(up, last < 0 ? 0 : last + 1 + line.gap)
+      while (!fits(row)) row++
+      take(row, textFrom, textTo)
+      for (const i of line.items) for (let r = row - i.up; r <= row + i.down; r++) if (r !== row) take(r, i.x, i.x + i.width)
+      placed.push({ line, row })
+      last = row
+    }
+    const height = Math.max(...[...taken.keys()]) + 1
+    const children: JSX.Element[] = []
+    for (const { line, row } of placed) {
+      if (line.marker) children.push(<Box position="absolute" top={row} left={line.marker.x}><Text>{line.marker.text}</Text></Box>)
+      if (line.quote !== undefined) children.push(<Box position="absolute" top={row} left={line.quote}><Text dimColor>▎</Text></Box>)
+      for (const item of line.items) children.push(item.el(row))
+    }
+    if (out.length === 0) firstRow = marginTop + (placed[0]?.row ?? 0)
+    out.push(<Box marginTop={marginTop} position="relative" height={height} flexShrink={0}>{children}</Box>)
+    group = []
+  }
+
+  let pendingGap = 0
   layoutProse(md).forEach((block, n) => {
-    const marginTop = block.gap && n > 0 ? 1 : 0
+    const gap = block.gap && n > 0 ? 1 : 0
     if (block.kind === 'markdown') {
-      out.push(<Box marginTop={marginTop}><Markdown text={inlineToUnicode(block.text)} /></Box>)
+      flushGroup(pendingGap)
+      pendingGap = 0
+      out.push(<Box marginTop={gap}><Markdown text={inlineToUnicode(block.text)} /></Box>)
       return
     }
-    // Lines are broken here, so each knows the formulas it holds: a line grows
-    // above and below its text row as far as its tallest formula reaches, and
-    // every word and formula on it shares one baseline.
+    if (group.length === 0) pendingGap = gap
     const markerWidth = block.marker ? textWidth(block.marker) + 1 : 0
-    const avail = Math.max(10, (lastRoom ?? 76) - block.indent - markerWidth - (block.quote ? 2 : 0))
+    const left = block.indent + markerWidth + (block.quote ? 2 : 0)
+    const avail = Math.max(10, room - left)
     const measured = block.tokens.map(token => {
       const parts = token.map(part => {
         if (part.kind === 'md') return { part, width: part.width, pic: undefined as Picture | undefined }
@@ -367,53 +424,51 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
     let line: typeof measured = []
     let used = 0
     for (const token of measured) {
-      const need = line.length === 0 ? token.width : used + 1 + token.width
-      if (line.length > 0 && need > avail) {
+      if (line.length > 0 && used + 1 + token.width > avail) {
         lines.push(line)
         line = []
-        used = 0
       }
       used = line.length === 0 ? token.width : used + 1 + token.width
       line.push(token)
     }
     if (line.length > 0) lines.push(line)
 
-    const rendered = lines.map(tokens => {
-      const above = Math.max(0, ...tokens.flatMap(t => t.parts.map(p => p.pic?.rowsAbove ?? 0)))
-      return {
-        above,
-        el: (
-          <Box flexDirection="row" columnGap={1} alignItems="flex-start">
-            {tokens.map(t => (
-              <Box flexDirection="row" flexShrink={0}>
-                {t.parts.map(({ part, pic }) => {
-                  if (part.kind === 'md') return <Box marginTop={above}><Markdown text={part.text} /></Box>
-                  const alt = texToUnicode(part.tex) || ' '
-                  return pic ? (
-                    <Box marginTop={above - (pic.rowsAbove ?? 0)}>
-                      <Image key={key()} source={{ file: pic.path, format: 'png' }} columns={pic.columns} rows={pic.rows} alt={alt} />
-                    </Box>
-                  ) : (
-                    <Box marginTop={above}><Markdown text={escapeMarkdown(alt)} /></Box>
-                  )
-                })}
-              </Box>
-            ))}
-          </Box>
-        ),
+    lines.forEach((tokens, k) => {
+      const items: Placed[] = []
+      let x = left
+      for (const token of tokens) {
+        for (const { part, width, pic } of token.parts) {
+          const at = x
+          if (part.kind === 'md') {
+            items.push({ x: at, width, up: 0, down: 0, isText: true, el: top => <Box position="absolute" top={top} left={at}><Markdown text={part.text} /></Box> })
+          } else if (pic) {
+            const up = pic.rowsAbove ?? 0
+            const id = key()
+            items.push({
+              x: at, width, up, down: pic.rows - 1 - up, isText: false,
+              el: top => (
+                <Box position="absolute" top={top - up} left={at}>
+                  <Image key={id} source={{ file: pic.path, format: 'png' }} columns={pic.columns} rows={pic.rows} alt={texToUnicode(part.tex) || ' '} />
+                </Box>
+              ),
+            })
+          } else {
+            const alt = escapeMarkdown(texToUnicode(part.tex) || ' ')
+            items.push({ x: at, width, up: 0, down: 0, isText: true, el: top => <Box position="absolute" top={top} left={at}><Markdown text={alt} /></Box> })
+          }
+          x += width
+        }
+        x += 1
       }
+      group.push({
+        items,
+        gap: k === 0 && group.length > 0 ? gap : 0,
+        ...(k === 0 && block.marker ? { marker: { x: block.indent, text: block.marker } } : {}),
+        ...(block.quote ? { quote: block.indent } : {}),
+      })
     })
-    const firstAbove = rendered[0]?.above ?? 0
-    out.push(
-      <Box flexDirection="row" marginTop={marginTop} marginLeft={block.indent}>
-        {block.marker ? <Box flexShrink={0} marginRight={1} marginTop={firstAbove}><Text>{block.marker}</Text></Box> : null}
-        {block.quote ? <Box flexShrink={0} marginRight={1}><Text dimColor>▎</Text></Box> : null}
-        <Box flexDirection="column" flexGrow={1} flexShrink={1}>
-          {rendered.map(r => r.el)}
-        </Box>
-      </Box>,
-    )
   })
+  flushGroup(pendingGap)
   return out
 }
 
