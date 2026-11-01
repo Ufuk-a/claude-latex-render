@@ -1,5 +1,5 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { Chunk, EngineInterface, Register } from 'claude-code'
 
 import type { Live, Mode } from '../types'
 
@@ -28,10 +28,6 @@ import { hasInlineMath, inlineTexes, layoutProse } from './flow'
 // the picture to its cells, so this only sets how crisp they are.
 const ROW_PX = 40
 const VERSION = 1
-// The most rows the live band above the prompt takes.
-const LIVE_ROWS = 40
-// What can open math, a figure or a LaTeX environment: the held part of a block starts at its line.
-const MATH_OPENER = /\$|\\[\[(]|\\begin\{|```tikz/
 
 type Display = Segment & { kind: 'display' }
 type Figure = Segment & { kind: 'figure' }
@@ -63,7 +59,7 @@ let colors: Promise<Palette> | undefined
 // `/latex` flips this; in `source` every reply is drawn as written.
 const mode = atom({ plugin: 'latex-render', key: 'mode' } as const, 'render' as Mode)
 // The part of the block being streamed that is held back, drawn above the prompt until it ends.
-const live = atom({ plugin: 'latex-render', key: 'live' } as const, { text: '', bullet: false, v: 0 } as Live)
+const live = atom({ plugin: 'latex-render', key: 'live' } as const, { id: '', text: '', v: 0 } as Live)
 // Pictures already fitted, by fitId, so the band draws without waiting on TeX.
 const ready = new Map<string, Picture | undefined>()
 const typeset = new Map<string, Promise<Typeset | undefined>>()
@@ -116,52 +112,55 @@ export const register: Register = (on, options) => {
     return { text: chosen === 'source' ? 'LaTeX is shown as written.' : 'LaTeX is rendered.' }
   })
 
-  // While a reply streams, its text from the first character that could open
-  // math is held back from the engine until just before the block's end, so
-  // raw LaTeX never shows in the streaming row. The held text is drawn live,
-  // typeset, in the band above the prompt, right under the reply it continues;
-  // at the block's end it is released whole (the transcript keeps the same
-  // text) and the engine draws the finished block in place.
+  // While a reply streams, each text block is held back from the engine,
+  // with the engine's own start-of-block item, until the block ends, so the
+  // engine's raw streaming row never shows. The held text is drawn live,
+  // typeset, in a row placed in the transcript where the reply is being
+  // written; it scrolls with the conversation like any reply. At the block's
+  // end everything is released in order (the transcript keeps the same text),
+  // the engine draws the finished block in place, and the placed row empties.
   on('turn.step', async function* ($, e, next) {
     const onTerminal = e.agentId === undefined && (await $.session.surfaces()).includes('terminal')
     if (!onTerminal || !settings.live || (await read($, mode)) === 'source') return yield* next(e)
-    let held: { first: any; text: string; index: number; bullet: boolean } | undefined
-    let streamedIn = new Map<number, number>() // characters passed through per block
+    type Held = { before: Chunk<'turn.step'>[]; first: Chunk<'turn.step'>; text: string; index: number; after: Chunk<'turn.step'>[] }
+    let waiting: Chunk<'turn.step'>[] = [] // engine items not yet known to open a text block
+    let held: Held | undefined
     let settled = 0
+    let blocks = 0
     const release = function* () {
-      if (!held) return
-      const chunk = { ...held.first, text: held.text }
-      held = undefined
-      settled = 0
-      yield chunk
-      void update($, live, () => ({ text: '', bullet: false, v: 0 })).catch(() => undefined)
+      if (held) {
+        const block = held
+        held = undefined
+        settled = 0
+        yield* block.before
+        yield { ...(block.first as object), text: block.text } as Chunk<'turn.step'>
+        yield* block.after
+        void update($, live, () => ({ id: '', text: '', v: 0 })).catch(() => undefined)
+      }
+      yield* waiting
+      waiting = []
     }
     try {
       for await (const chunk of next(e)) {
-        if (chunk.kind !== 'text') {
+        if (chunk.kind === 'engine') {
+          ;(held ? held.after : waiting).push(chunk)
+          continue
+        }
+        if (chunk.kind === 'text' && held && held.index === chunk.index && held.after.length === 0) {
+          held.text += chunk.text
+        } else if (chunk.kind === 'text') {
+          yield* release()
+          const id = `live-${e.turnId}-${e.index}-${blocks++}`
+          held = { before: waiting, first: chunk, text: chunk.text, index: chunk.index, after: [] }
+          waiting = []
+          void $.ui.place({ id }).catch(() => undefined)
+          const text = held.text
+          void update($, live, () => ({ id, text, v: 1 })).catch(() => undefined)
+          continue
+        } else {
           yield* release()
           yield chunk
           continue
-        }
-        if (held && held.index !== chunk.index) yield* release()
-        if (!held) {
-          const at = chunk.text.search(MATH_OPENER)
-          if (at < 0) {
-            streamedIn.set(chunk.index, (streamedIn.get(chunk.index) ?? 0) + chunk.text.length)
-            yield chunk
-            continue
-          }
-          // Cut back to the start of the line, so a sentence is never split between the row and the band.
-          const before = chunk.text.slice(0, at)
-          const nl = before.lastIndexOf('\n')
-          const cut = nl >= 0 ? nl + 1 : (streamedIn.get(chunk.index) ?? 0) === 0 ? 0 : at
-          if (cut > 0) {
-            streamedIn.set(chunk.index, (streamedIn.get(chunk.index) ?? 0) + cut)
-            yield { ...chunk, text: chunk.text.slice(0, cut) }
-          }
-          held = { first: cut > 0 ? { kind: 'text', index: chunk.index } : chunk, text: chunk.text.slice(cut), index: chunk.index, bullet: (streamedIn.get(chunk.index) ?? 0) === 0 }
-        } else {
-          held.text += chunk.text
         }
         const text = held.text
         const upTo = settledLength(text)
@@ -169,8 +168,7 @@ export const register: Register = (on, options) => {
           void prepareLive($, text.slice(settled, upTo))
           settled = upTo
         }
-        const bullet = held.bullet
-        void update($, live, cur => ({ text, bullet, v: cur.v + 1 })).catch(() => undefined)
+        void update($, live, cur => ({ ...cur, text, v: cur.v + 1 })).catch(() => undefined)
       }
     } catch (err) {
       // An interrupted stream still records the text it held.
@@ -180,77 +178,13 @@ export const register: Register = (on, options) => {
     yield* release()
   })
 
-  // Above the prompt, while Claude writes: the held part of the block being
-  // written, drawn as the finished block will be, its newest rows when it is long.
-  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    const [state, current] = await Promise.all([read($, live), read($, mode)])
-    const { hasSurvey, maxRows, bodyColumns, view } = e.props
-    const budget = Math.min(maxRows - 2, LIVE_ROWS)
-    if (!state.text || current === 'source' || hasSurvey || view.agentId !== undefined || e.surface !== 'terminal' || budget < 2) return next(e)
-    const room = lastRoom ?? Math.max(10, bodyColumns - 4)
+  // The live row: the held block drawn as the finished block will be.
+  on('ui.render', { component: 'Placed' }, async ($, e, next) => {
+    const state = await read($, live)
+    if (e.props.plugin !== $.plugin.name || e.props.id !== state.id || !state.text || e.surface !== 'terminal') return next(e)
     const { stable, pending } = splitPending(state.text)
-    const segments = splitMath(stable)
-    const draws = await imagesOn($)
-    const els = $.ui.resolve(e)
-    const { Box, Text, Image } = els
-    // Each piece with the rows it is expected to take, newest kept when over budget.
-    const pieces: { el: JSX.Element; rows: number }[] = []
-    let pendingText = ''
-    let keyer = 0
-    const bump = () => update($, live, cur => ({ ...cur, v: cur.v + 1 })).catch(() => undefined)
-    const flushText = () => {
-      const md = pendingText.replace(/^\s*\n/, '').replace(/\n\s*$/, '')
-      if (md.trim() !== '') {
-        const pic = (tex: string) => {
-          const ready = inlineReady.get(inlineId(tex, room))
-          if (!ready && draws && settings.inline) void fitInline($, tex, room).then(p => (p ? bump() : undefined))
-          return ready
-        }
-        const drawn = draws ? drawProse(els, md, pic, () => `l${keyer++}`) : [<els.Markdown text={inlineToUnicode(md)} />]
-        const rows = estimateRows(inlineToUnicode(md), room)
-        drawn.forEach((el, k) => pieces.push({ el, rows: k === 0 ? rows : 0 }))
-      }
-      pendingText = ''
-    }
-    segments.forEach((s, index) => {
-      if (s.kind === 'markdown') { pendingText += s.text; return }
-      const picture = draws ? readyPicture(s, room) : undefined
-      if (!picture) {
-        if (draws) void fit($, s, room).then(() => update($, live, cur => ({ ...cur, v: cur.v + 1 }))).catch(() => undefined)
-        pendingText += segmentsToUnicode([s])
-        return
-      }
-      flushText()
-      pieces.push({
-        el: (
-          <Box marginLeft={2}>
-            <Image key={`live-${index}`} source={{ file: picture.path, format: 'png' }} columns={picture.columns} rows={picture.rows} alt={s.kind === 'figure' ? 'TikZ figure' : texToUnicode(s.tex) || ' '} />
-          </Box>
-        ),
-        rows: picture.rows,
-      })
-    })
-    flushText()
-    if (pending) pieces.push({ el: <Box marginLeft={2}><Text dimColor>{pending}</Text></Box>, rows: 1 })
-    let left = budget
-    const shown: JSX.Element[] = []
-    for (let i = pieces.length - 1; i >= 0; i--) {
-      const piece = pieces[i]!
-      if (piece.rows > left && shown.length > 0) break
-      shown.unshift(piece.el)
-      left -= piece.rows
-    }
-    if (shown.length === 0) return next(e)
-    return (
-      <Box flexDirection="row">
-        <Box width={2} flexShrink={0}>
-          <Text>{state.bullet ? '●' : ' '}</Text>
-        </Box>
-        <Box flexDirection="column" flexGrow={1}>
-          {shown}
-        </Box>
-      </Box>
-    )
+    const tree = await drawReply($, e, stable, { wait: false, bullet: true, pending })
+    return tree ?? next(e)
   })
 
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => {
@@ -258,75 +192,98 @@ export const register: Register = (on, options) => {
     if ((await read($, mode)) === 'source') return next(e)
     const text = e.props.text
     if (!hasMath(text)) return next(e)
-
-    const segments = splitMath(text)
-    const hasDisplay = segments.some(s => s.kind !== 'markdown')
-    // A summary row stays one line of text: its math in Unicode, never a picture.
-    const drawsPictures = !e.props.isSummary && e.surface === 'terminal' && hasDisplay && (await imagesOn($))
-
-    if (!drawsPictures) {
-      const rewritten = segmentsToUnicode(segments)
+    if (e.props.isSummary || e.surface !== 'terminal' || !(await imagesOn($))) {
+      const rewritten = segmentsToUnicode(splitMath(text))
       return rewritten === text ? next(e) : next({ ...e, props: { ...e.props, text: rewritten } })
     }
+    lastRoom = Math.max(10, (e.viewport?.columns ?? 80) - 4)
+    const tree = await drawReply($, e, text, { wait: true, bullet: e.props.isFirstOfReply })
+    return tree ?? next(e)
+  })
+}
 
-    const room = Math.max(10, (e.viewport?.columns ?? 80) - 4)
-    lastRoom = room
-    const pictures = await Promise.all(
-      segments.map(s => (s.kind === 'markdown' ? Promise.resolve(undefined) : fit($, s, room))),
-    )
+// A block of a reply, its formulas and figures as pictures and its prose as
+// the engine's Markdown. Waiting, it typesets everything first; not waiting
+// (the live row), it draws what is ready and redraws as the rest arrives.
+async function drawReply(
+  $: EngineInterface,
+  e: Parameters<EngineInterface['ui']['resolve']>[0],
+  text: string,
+  opts: { wait: boolean; bullet: boolean; pending?: string },
+): Promise<JSX.Element | undefined> {
+  const room = lastRoom ?? 76
+  const segments = splitMath(text)
+  const els = $.ui.resolve(e)
+  const { Box, Text, Image, Markdown } = els as any
+  const bump = () => update($, live, cur => ({ ...cur, v: cur.v + 1 })).catch(() => undefined)
+  const prose = segments.filter(s => s.kind === 'markdown').map(s => s.text).join('\n\n')
 
-    const els = $.ui.resolve(e)
-    const { Box, Text, Image } = els
-    const prose = segments.filter(s => s.kind === 'markdown').map(s => s.text).join('\n\n')
-    const inlinePics = new Map<string, Picture | undefined>()
-    if (settings.inline) {
-      const texes = [...new Set(inlineTexes(prose))]
+  const pictures: (Picture | undefined)[] = opts.wait
+    ? await Promise.all(segments.map(s => (s.kind === 'markdown' ? undefined : fit($, s, room))))
+    : segments.map(s => {
+        if (s.kind === 'markdown') return undefined
+        const ready = readyPicture(s, room)
+        if (!ready) void fit($, s, room).then(p => (p ? bump() : undefined))
+        return ready
+      })
+  const inlinePics = new Map<string, Picture | undefined>()
+  if (settings.inline) {
+    const texes = [...new Set(inlineTexes(prose))]
+    if (opts.wait) {
       const fitted = await Promise.all(texes.map(tex => fitInline($, tex, room)))
       texes.forEach((tex, k) => inlinePics.set(tex, fitted[k]))
-    }
-    const children: JSX.Element[] = []
-    let pendingText = ''
-    let keyer = 0
-    const flushText = () => {
-      const md = pendingText.replace(/^\s*\n/, '').replace(/\n\s*$/, '')
-      if (md.trim() !== '') children.push(...drawProse(els, md, tex => inlinePics.get(tex), () => `m${keyer++}`))
-      pendingText = ''
-    }
-
-    segments.forEach((s, index) => {
-      const picture = pictures[index]
-      if (s.kind === 'markdown') {
-        pendingText += s.text
-      } else if (!picture) {
-        pendingText += segmentsToUnicode([s])
-      } else {
-        flushText()
-        children.push(
-          <Box marginLeft={2}>
-            <Image
-              key={`${s.kind === 'figure' ? 'figure' : 'math'}-${index}`}
-              source={{ file: picture.path, format: 'png' }}
-              columns={picture.columns}
-              rows={picture.rows}
-              alt={s.kind === 'figure' ? 'TikZ figure' : texToUnicode(s.tex) || ' '}
-            />
-          </Box>,
-        )
+    } else {
+      for (const tex of texes) {
+        const ready = inlineReady.get(inlineId(tex, room))
+        if (!ready) void fitInline($, tex, room).then(p => (p ? bump() : undefined))
+        inlinePics.set(tex, ready)
       }
-    })
-    flushText()
+    }
+  }
 
-    return (
-      <Box flexDirection="row">
-        <Box width={2} flexShrink={0}>
-          <Text>{e.props.isFirstOfReply ? '●' : ' '}</Text>
-        </Box>
-        <Box flexDirection="column" flexGrow={1}>
-          {children}
-        </Box>
-      </Box>
-    )
+  const children: JSX.Element[] = []
+  let pendingText = ''
+  let keyer = 0
+  const flushText = () => {
+    const md = pendingText.replace(/^\s*\n/, '').replace(/\n\s*$/, '')
+    if (md.trim() !== '') children.push(...drawProse(els, md, tex => inlinePics.get(tex), () => `p${keyer++}`))
+    pendingText = ''
+  }
+  segments.forEach((s, index) => {
+    const picture = pictures[index]
+    if (s.kind === 'markdown') {
+      pendingText += s.text
+    } else if (!picture) {
+      pendingText += segmentsToUnicode([s])
+    } else {
+      flushText()
+      children.push(
+        <Box marginLeft={2}>
+          <Image
+            key={`${s.kind === 'figure' ? 'figure' : 'math'}-${index}`}
+            source={{ file: picture.path, format: 'png' }}
+            columns={picture.columns}
+            rows={picture.rows}
+            alt={s.kind === 'figure' ? 'TikZ figure' : texToUnicode(s.tex) || ' '}
+          />
+        </Box>,
+      )
+    }
   })
+  flushText()
+  if (opts.pending) children.push(<Box marginLeft={2}><Text dimColor>{opts.pending}</Text></Box>)
+  if (children.length === 0) return undefined
+  void Markdown
+  return (
+    <Box flexDirection="row">
+      <Box width={2} flexShrink={0}>
+        <Text>{opts.bullet ? '●' : ' '}</Text>
+      </Box>
+      <Box flexDirection="column" flexGrow={1}>
+        {children}
+      </Box>
+    </Box>
+  )
 }
 
 function drawnIn(text: string): Drawn[] {
@@ -373,9 +330,6 @@ function splitPending(text: string): { stable: string; pending?: string } {
   return { stable: text }
 }
 
-function estimateRows(markdown: string, columns: number): number {
-  return markdown.split('\n').reduce((n, line) => n + Math.max(1, Math.ceil(line.length / Math.max(10, columns))), 0)
-}
 
 function readyPicture(segment: Drawn, room: number): Picture | undefined {
   return ready.get(fitId(segment, room))

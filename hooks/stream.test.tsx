@@ -53,9 +53,9 @@ describe('turn.step', () => {
     engine(on, streamed, reply)
     const chunks = await collect($.turn.step(step))
     const texts = chunks.filter(c => c.kind === 'text').map(c => (c as { text: string }).text)
-    // The line before the formula streams; from the formula's line on, the block is held and released in one piece.
-    expect(texts).toEqual(['Take\n', '$$x^2$$\n\nso it grows, and more text follows.'])
-    expect(chunks.map(c => c.kind)).toEqual(['text', 'text', 'tool', 'stop'])
+    // The whole block is held and released in one piece, before what follows it.
+    expect(texts).toEqual(['Take\n$$x^2$$\n\nso it grows, and more text follows.'])
+    expect(chunks.map(c => c.kind)).toEqual(['text', 'tool', 'stop'])
   })
 
   test('a run with no terminal holds nothing back', { options: { images: 'on' } }, async ($, on) => {
@@ -74,16 +74,18 @@ const PNG = btoa(
 
 const band = { hasSurvey: false, isWorking: true, maxRows: 20, bodyColumns: 80, scroll: { offset: 0, bodyRows: 19 }, view: {} }
 
-describe('live band', () => {
-  test('held text shows above the prompt while its block streams, and goes when it ends', { options: { images: 'on' } }, async ($, on) => {
+describe('live row', () => {
+  test('held text shows in its placed row while the block streams, and goes when it ends', { options: { images: 'on' } }, async ($, on) => {
     on('session.surfaces', () => ({ value: ['terminal'] as const }))
     on('env.get', () => ({ value: undefined }))
     on('process.run', () => ({ value: ran }))
     on('fs.exists', (_$, e) => ({ value: e.path.endsWith('.png') }))
     on('fs.read', () => ({ value: { base64: PNG } }))
-    on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
+    on('ui.place', () => ({ value: { isPlaced: true } }) as any)
+    // Stands for the engine's own empty row.
+    on('ui.render', { component: 'Placed' }, ($, e) => {
       const { Text } = $.ui.resolve(e)
-      return <Text>prompt band</Text>
+      return <Text>empty row</Text>
     })
     let open!: () => void
     const gate = new Promise<void>(resolve => (open = resolve))
@@ -95,16 +97,15 @@ describe('live band', () => {
       yield { kind: 'stop', stopReason: 'tool_use', usage: null } as const
       return { turnId: 't1', index: 0, answer: '', toolUses: [], stopReason: 'tool_use' as const, usage: null }
     })
-    const view = await $.ui.mount({ plugin: 'latex-render', surface: 'terminal', component: 'AbovePrompt', props: band })
+    const view = await $.ui.mount({ plugin: 'latex-render', surface: 'terminal', component: 'Placed', props: { id: 'live-t1-0-0', plugin: 'latex-render' } })
     const showing = async () => JSON.stringify(await view.drawn()).includes('so it grows')
 
     const stream = $.turn.step(step)[Symbol.asyncIterator]()
-    await stream.next() // 'Take\n' streams; the rest is held
-    const released = stream.next() // waits on the gate, holding the formula and the text after it
+    const released = stream.next() // waits on the gate, holding the whole block
     for (let i = 0; i < 200; i++) await Promise.resolve()
     expect(await showing()).toBe(true)
     open()
-    expect(((await released).value as { text: string }).text).toBe('$$x^2$$\n\nso it grows')
+    expect(((await released).value as { text: string }).text).toBe('Take\n$$x^2$$\n\nso it grows')
     while (!(await stream.next()).done);
     expect(await showing()).toBe(false)
   })
