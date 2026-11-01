@@ -158,6 +158,29 @@ const rowLayouts = new Map<string, RowLayout>()
 // finish (a formula still failing) is not asked again on every scroll step.
 const redoneAt = new Map<string, number>()
 const roomOf = (columns: number) => Math.max(10, columns - 4)
+// After a (re)load the module knows nothing, and the engine shows a row it cannot
+// answer at once some other way, at another height: the scroll jumps. So the first
+// render ask lays out every finished block at once, before anyone scrolls to them.
+let warmed = false
+async function warmUp($: EngineInterface, e: any) {
+  if (warmed || e.surface !== 'terminal' || !e.viewport) return
+  warmed = true
+  modeNow = await read($, mode)
+  const finished = await read($, done)
+  for (const [id, t] of Object.entries(finished)) {
+    doneById.set(id, t)
+    doneTexts.add(t)
+  }
+  if (modeNow !== 'render' || !(await imagesOn($))) return
+  await cells($, e.viewport.columns)
+  lastRoom ??= roomOf(e.viewport.columns)
+  // Newest first: the reader is at the bottom.
+  for (const [id, t] of Object.entries(finished).reverse()) {
+    if (!rowLayouts.has(`placed\u0000${id}`)) await drawReply($, e, t, { wait: true, bullet: true, plain: !hasMath(t), rowKey: `placed\u0000${id}` }).catch(() => undefined)
+  }
+  $.ui.invalidate('ui.render')
+}
+
 function fromRow(rowKey: string, room: number, onScreen: { first: number; last: number } | null | undefined, viewRows: number, redo: () => Promise<unknown>): JSX.Element | undefined {
   const row = rowLayouts.get(rowKey)
   if (!row) return undefined
@@ -320,6 +343,7 @@ export const register: Register = (on, options) => {
   // The live row: the held block drawn as the finished block will be; once the
   // block is finished, in fullscreen, the finished block itself.
   on('ui.render', { component: 'Placed' }, async ($, e, next) => perf($, 'Placed', async () => {
+    void warmUp($, e).catch(() => undefined)
     if (e.props.plugin === $.plugin.name && e.surface === 'terminal' && modeNow === 'render' && e.viewport) {
       const rowKey = `placed\u0000${e.props.id}`
       const text = doneById.get(e.props.id)
@@ -361,6 +385,7 @@ export const register: Register = (on, options) => {
   }))
 
   on('ui.render', { component: 'AssistantMessage' }, async ($, e, next) => perf($, 'AssistantMessage', async () => {
+    void warmUp($, e).catch(() => undefined)
     // The fast path: a reply already laid out comes back at once. The engine
     // asks again on every scroll step and drops an answer still in flight when
     // the next ask comes, so a round trip here would leave rows undrawn.
