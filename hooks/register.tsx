@@ -22,7 +22,7 @@ import {
   texToUnicode,
 } from './latex'
 import type { Segment } from './latex'
-import { hasInlineMath, inlineTexes, layoutProse, textWidth } from './flow'
+import { escapeWord, hasInlineMath, inlineTexes, layoutProse, textWidth } from './flow'
 import type { Token } from './flow'
 
 // Pixels per terminal row the formulas are typeset at; the terminal scales
@@ -33,6 +33,8 @@ import type { Token } from './flow'
 // cellAspect setting stand in where it cannot.
 let ROW_PX = 40
 let CELL_W: number | undefined
+// The terminal's width in columns, for where the engine does not say (outside fullscreen).
+let TERM_COLS: number | undefined
 let cellsFor: { columns: number; pending: Promise<void> } | undefined
 const CELL_PROBE = [
   'import os, fcntl, termios, struct',
@@ -47,7 +49,7 @@ const CELL_PROBE = [
   '            h = os.open(t, os.O_RDONLY | os.O_NOCTTY)',
   '            r, c, x, y = struct.unpack("HHHH", fcntl.ioctl(h, termios.TIOCGWINSZ, bytes(8)))',
   '            if x and y:',
-  '                print(x / c, y / r)',
+  '                print(x / c, y / r, c)',
   '                raise SystemExit',
   '    p = int(open(f"/proc/{p}/stat").read().rsplit(")", 1)[1].split()[1])',
 ].join('\n')
@@ -59,13 +61,19 @@ function cells($: EngineInterface, columns: number | undefined): Promise<void> {
   const pending = $.process
     .run(['python3', '-c', CELL_PROBE], { timeoutMs: 3000 })
     .then(r => {
-      const [w, h] = r.stdout.trim().split(/\s+/).map(Number)
+      const [w, h, c] = r.stdout.trim().split(/\s+/).map(Number)
       if (r.exitCode === 0 && w && h && w > 2 && h > 4) {
         ROW_PX = Math.round(h)
         CELL_W = w
       }
+      if (c && c > 10) TERM_COLS = c
     })
-    .catch(() => undefined)
+    .catch(err => {
+      if (isAbort(err)) {
+        cellsFor = undefined
+        redrawLater($)
+      }
+    })
   cellsFor = { columns: key, pending }
   return pending
 }
@@ -93,11 +101,12 @@ type Settings = {
   inline: boolean
   inlineScale: number
   inlineBaseline: number
+  displayAlign: string
 }
 
 // What the module learns once per load: its options, whether pictures can be
 // drawn, the cache folder, the colors, and every formula and figure typeset so far.
-let settings: Settings = { images: 'auto', color: 'auto', scale: 1.25, cellAspect: 2.1, preamble: '', background: 'auto', live: true, inline: true, inlineScale: 1, inlineBaseline: 0.8 }
+let settings: Settings = { images: 'auto', color: 'auto', scale: 1.25, cellAspect: 2.1, preamble: '', background: 'auto', live: true, inline: true, inlineScale: 1, inlineBaseline: 0.8, displayAlign: 'center' }
 let canDraw: Promise<boolean> | undefined
 let canDrawFigures: Promise<boolean> | undefined
 let cacheDir: Promise<string> | undefined
@@ -134,6 +143,7 @@ export const register: Register = (on, options) => {
     inline: String(options.inlineImages ?? 'on') !== 'off',
     inlineScale: clamp(Number(options.inlineScale) || 1, 0.5, 2),
     inlineBaseline: clamp(Number(options.inlineBaseline) || 0.8, 0.5, 0.95),
+    displayAlign: String(options.displayAlign ?? 'center') === 'left' ? 'left' : 'center',
   }
   // What was found for the previous options no longer holds.
   canDraw = canDrawFigures = colors = undefined
@@ -241,6 +251,7 @@ export const register: Register = (on, options) => {
     const state = await read($, live)
     if (e.props.plugin !== $.plugin.name || e.props.id !== state.id || !state.text || e.surface !== 'terminal') return next(e)
     await cells($, lastRoom === undefined ? undefined : lastRoom + 4)
+    lastRoom ??= TERM_COLS === undefined ? undefined : Math.max(10, TERM_COLS - 4)
     const tree = await drawReply($, e, splitPending(state.text), { wait: false, bullet: true })
     return tree ?? next(e)
   })
@@ -254,8 +265,8 @@ export const register: Register = (on, options) => {
       const rewritten = segmentsToUnicode(splitMath(text))
       return rewritten === text ? next(e) : next({ ...e, props: { ...e.props, text: rewritten } })
     }
-    lastRoom = Math.max(10, (e.viewport?.columns ?? 80) - 4)
     await cells($, e.viewport?.columns)
+    lastRoom = Math.max(10, (e.viewport?.columns ?? TERM_COLS ?? 80) - 4)
     const tree = await drawReply($, e, text, { wait: true, bullet: e.props.isFirstOfReply })
     return tree ?? next(e)
   })
@@ -327,7 +338,7 @@ async function drawReply(
     } else {
       flushText()
       children.push(
-        <Box marginLeft={2}>
+        <Box {...(settings.displayAlign === 'center' ? { justifyContent: 'center' } : { marginLeft: 2 })}>
           <Image
             key={`${s.kind === 'figure' ? 'figure' : 'math'}-${index}`}
             source={{ file: picture.path, format: 'png' }}
@@ -464,6 +475,10 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
     const taken = new Map<number, [number, number][]>()
     const free = (row: number, x0: number, x1: number) => !(taken.get(row) ?? []).some(([a, b]) => x0 < b && a < x1)
     const take = (row: number, x0: number, x1: number) => taken.set(row, [...(taken.get(row) ?? []), [x0, x1]])
+    // Air kept around hanging formulas, which only other formulas stay out of.
+    const air = new Map<number, [number, number][]>()
+    const hold = (row: number, x0: number, x1: number) => air.set(row, [...(air.get(row) ?? []), [x0, x1]])
+    const clear = (row: number, x0: number, x1: number) => !(air.get(row) ?? []).some(([a, b]) => x0 < b && a < x1)
     const placed: { line: Line; row: number }[] = []
     let last = -1
     let blockBottom = -1 // lowest row the block being placed reaches
@@ -481,7 +496,10 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
         row - up >= 0 &&
         free(row, textFrom, textTo) &&
         line.items.every(i => {
-          for (let r = row - i.up; r <= row + i.down; r++) if (r !== row && !free(r, i.x, i.x + i.width)) return false
+          for (let r = row - i.up; r <= row + i.down; r++) {
+            if (r !== row && !free(r, i.x, i.x + i.width)) return false
+            if (!i.isText && i.up + i.down > 0 && !clear(r, i.x, i.x + i.width)) return false
+          }
           return true
         })
       // A block's text starts below everything the block before reaches: a heading
@@ -492,7 +510,14 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
       while (!fits(row)) row++
       blockBottom = Math.max(blockBottom, row + Math.max(0, ...line.items.map(i => i.down)))
       take(row, textFrom, textTo)
-      for (const i of line.items) for (let r = row - i.up; r <= row + i.down; r++) if (r !== row) take(r, i.x, i.x + i.width)
+      for (const i of line.items) {
+        for (let r = row - i.up; r <= row + i.down; r++) if (r !== row) take(r, i.x, i.x + i.width)
+        // A formula hanging below its line keeps a little air from later lines'
+        // formulas: a row under it and a column either side (text may still tuck in).
+        if (i.down > 0) {
+          for (let r = row + 1; r <= row + i.down + 1; r++) hold(r, i.x - 1, i.x + i.width + 1)
+        }
+      }
       placed.push({ line, row })
       last = row
     }
@@ -590,7 +615,7 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
             failed.set(written, failures.get(failureId('inline', part.tex))!)
             items.push({ x: at, width: textWidth(written), up: 0, down: 0, isText: true, cells: row => [[row, <Text color="error">{written}</Text>]] })
           } else {
-            const alt = escapeMarkdown(texToUnicode(part.tex) || ' ')
+            const alt = escapeWord(texToUnicode(part.tex) || ' ')
             items.push({ x: at, width, up: 0, down: 0, isText: true, cells: row => [[row, <Markdown text={alt} />]] })
           }
           x += width
@@ -626,7 +651,7 @@ function fitInline($: EngineInterface, tex: string, room: number): Promise<Pictu
   const id = inlineId(tex, room)
   let pending = inlineFitted.get(id)
   if (!pending) {
-    pending = padInline($, tex, room).catch(() => undefined)
+    pending = retryable($, inlineFitted, id, padInline($, tex, room))
     pending.then(picture => inlineReady.set(id, picture))
     inlineFitted.set(id, pending)
   }
@@ -639,7 +664,7 @@ function typesetInline($: EngineInterface, tex: string, size = 1): Promise<Inlin
   const id = `${ROW_PX}\u0000${size.toFixed(3)}\u0000${tex}`
   let pending = inlineTypeset.get(id)
   if (!pending) {
-    pending = slot(() => runInlineLatex($, tex, size)).catch(() => undefined)
+    pending = retryable($, inlineTypeset, id, slot(() => runInlineLatex($, tex, size)), true)
     inlineTypeset.set(id, pending)
   }
   return pending
@@ -759,15 +784,29 @@ function showMode($: EngineInterface, current: Mode): void {
 }
 
 function imagesOn($: EngineInterface): Promise<boolean> {
-  canDraw ??= detectImages($, settings.images)
+  canDraw ??= detectImages($, settings.images).catch(err => {
+    canDraw = undefined
+    if (isAbort(err)) redrawLater($)
+    return false
+  })
   return canDraw
 }
+
+// A tool check: whether the program ran fine; an aborted run is passed on, to be asked again.
+const works = (run: Promise<{ exitCode: number }>) =>
+  run.then(
+    r => r.exitCode === 0,
+    err => {
+      if (isAbort(err)) throw err
+      return false
+    },
+  )
 
 async function detectImages($: EngineInterface, option: string): Promise<boolean> {
   if (option === 'off') return false
   const tools = await Promise.all([
-    $.process.run(['latex', '--version']).then(r => r.exitCode === 0, () => false),
-    $.process.run(['dvipng', '--version']).then(r => r.exitCode === 0, () => false),
+    works($.process.run(['latex', '--version'])),
+    works($.process.run(['dvipng', '--version'])),
   ])
   if (!tools.every(Boolean)) return false
   if (option === 'on') return true
@@ -788,13 +827,17 @@ async function detectImages($: EngineInterface, option: string): Promise<boolean
 
 // Figures take pdflatex and pdftocairo besides what formulas take.
 function figuresOn($: EngineInterface): Promise<boolean> {
-  canDrawFigures ??= imagesOn($).then(async on => {
-    if (!on) return false
-    const tools = await Promise.all(
-      ['pdflatex', 'pdftocairo'].map(tool => $.process.run([tool, '-v']).then(r => r.exitCode === 0, () => false)),
-    )
-    return tools.every(Boolean)
-  })
+  canDrawFigures ??= imagesOn($)
+    .then(async on => {
+      if (!on) return false
+      const tools = await Promise.all(['pdflatex', 'pdftocairo'].map(tool => works($.process.run([tool, '-v']))))
+      return tools.every(Boolean)
+    })
+    .catch(err => {
+      canDrawFigures = undefined
+      if (isAbort(err)) redrawLater($)
+      return false
+    })
   return canDrawFigures
 }
 
@@ -824,12 +867,43 @@ async function pickPalette($: EngineInterface): Promise<Palette> {
   }
 }
 
+// Just after a (re)load the engine aborts the processes a module starts. An
+// aborted run is no answer: every cache it passes through forgets it (inner
+// layers rethrow, the outermost returns nothing), and a redraw is asked for
+// once things have settled. Other errors, and LaTeX's own, stay cached.
+const isAbort = (err: unknown) => /aborted/i.test(String(err))
+let redrawSoon = false
+function redrawLater($: EngineInterface): void {
+  if (redrawSoon) return
+  redrawSoon = true
+  void $.clock
+    .sleep(500)
+    .then(() => $.ui.invalidate('ui.render'))
+    .catch(() => undefined)
+    .finally(() => (redrawSoon = false))
+}
+function retryable<T>(
+  $: EngineInterface,
+  cache: Map<string, Promise<T | undefined>>,
+  id: string,
+  run: Promise<T | undefined>,
+  inner = false,
+): Promise<T | undefined> {
+  return run.catch(err => {
+    if (!isAbort(err)) return undefined
+    cache.delete(id)
+    redrawLater($)
+    if (inner) throw err
+    return undefined
+  })
+}
+
 // Typesets one formula or figure to a tight transparent PNG, cached on disk by content.
 function typesetSegment($: EngineInterface, segment: Drawn): Promise<Typeset | undefined> {
   const id = `${ROW_PX}\u0000` + (segment.kind === 'figure' ? `figure\u0000${segment.tex}` : `${segment.env}\u0000${segment.tex}`)
   let pending = typeset.get(id)
   if (!pending) {
-    pending = (segment.kind === 'figure' ? runTikz($, segment) : runLatex($, segment)).catch(() => undefined)
+    pending = retryable($, typeset, id, segment.kind === 'figure' ? runTikz($, segment) : runLatex($, segment), true)
     typeset.set(id, pending)
   }
   return pending
@@ -931,7 +1005,7 @@ function fit($: EngineInterface, segment: Drawn, room: number, rowLimit?: number
   const id = fitId(segment, room, rowLimit)
   let pending = fitted.get(id)
   if (!pending) {
-    pending = padToCells($, segment, room, rowLimit).catch(() => undefined)
+    pending = retryable($, fitted, id, padToCells($, segment, room, rowLimit))
     pending.then(picture => ready.set(id, picture))
     fitted.set(id, pending)
   }

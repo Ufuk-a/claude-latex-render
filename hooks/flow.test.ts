@@ -22,6 +22,6 @@ describe('flow', () => {
     ])
   })
   test('a word alone does not read as a block', async () => {
-    expect(words('step 1. then - and # x $y$')).toEqual(['step', '1\\.', 'then', '\\-', 'and', '\\#', 'x', '<y>'])
+    expect(words('step 1. then - and # x [$y$]')).toEqual(['step', '1.', 'then', '\\-', 'and', '\\#', 'x', '\\[<y>]'])
   })
 })

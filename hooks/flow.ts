@@ -197,9 +197,11 @@ function wrap(run: string, style: Style, isFirst: boolean): string {
   if (style.c) {
     out = run.includes('`') ? '`` ' + run + ' ``' : '`' + run + '`'
   } else {
-    out = run.replace(/[\\`*_[\]<>|~]/g, c => '\\' + c)
+    // Escaped only where an escape is both needed and removed by the engine's
+    // renderer (it shows `\]` and `1\.` as written, and a lone `]` or `1.` is harmless).
+    out = run.replace(/[\\`*_[<>|~]/g, c => '\\' + c)
     // A word alone must not read as a block: a heading, quote, list item or rule.
-    if (isFirst) out = out.replace(/^([#+\-=])/, '\\$1').replace(/^(\d+)([.)])/, '$1\\$2')
+    if (isFirst) out = out.replace(/^([#+\-=])/, '\\$1')
   }
   if (style.s) out = `~~${out}~~`
   if (style.i) out = `*${out}*`
@@ -209,6 +211,10 @@ function wrap(run: string, style: Style, isFirst: boolean): string {
 }
 
 /** Terminal columns a string takes: wide East Asian and emoji 2, combining marks 0. */
+export function escapeWord(text: string): string {
+  return text.replace(/[\\`*_[<>|~]/g, c => '\\' + c).replace(/^([#+\-=])/, '\\$1')
+}
+
 export function textWidth(text: string): number {
   let width = 0
   for (const ch of text) {

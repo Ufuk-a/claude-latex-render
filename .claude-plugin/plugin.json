@@ -82,6 +82,16 @@
       "title": "Inline baseline",
       "description": "Where the terminal font's baseline sits in a cell, as a fraction of its height from the top; nudge it if inline formulas sit too high or too low",
       "default": 0.8
+    },
+    "displayAlign": {
+      "type": "string",
+      "title": "Display math alignment",
+      "description": "center: display formulas and figures centred across the reply's width; left: at the left margin",
+      "options": [
+        "center",
+        "left"
+      ],
+      "default": "center"
     }
   }
 }
