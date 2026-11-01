@@ -21,7 +21,7 @@ describe('flow', () => {
       '|2|true', '•|2|true', '•|2|false', 'md:plain text',
     ])
   })
-  test('a word alone does not read as a block', async () => {
-    expect(words('step 1. then - and # x [$y$]')).toEqual(['step', '1.', 'then', '\\-', 'and', '\\#', 'x', '\\[<y>]'])
+  test('block markers are left to the row drawing (the engine shows \\= as written)', async () => {
+    expect(words('step 1. then - and # x = y + z [$y$]')).toEqual(['step', '1.', 'then', '-', 'and', '#', 'x', '=', 'y', '+', 'z', '\\[<y>]'])
   })
 })

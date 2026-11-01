@@ -164,7 +164,7 @@ export function tokenize(text: string, bold = false): Token[] {
   let run = ''
   let runStyle: Style | undefined
   const flushRun = () => {
-    if (run) token.push({ kind: 'md', text: wrap(run, runStyle!, token.length === 0), width: textWidth(run) })
+    if (run) token.push({ kind: 'md', text: wrap(run, runStyle!), width: textWidth(run) })
     run = ''
     runStyle = undefined
   }
@@ -192,16 +192,15 @@ function sameStyle(a: Style, b: Style): boolean {
   return a.b === b.b && a.i === b.i && a.s === b.s && a.c === b.c && a.link === b.link
 }
 
-function wrap(run: string, style: Style, isFirst: boolean): string {
+function wrap(run: string, style: Style): string {
   let out: string
   if (style.c) {
     out = run.includes('`') ? '`` ' + run + ' ``' : '`' + run + '`'
   } else {
     // Escaped only where an escape is both needed and removed by the engine's
-    // renderer (it shows `\]` and `1\.` as written, and a lone `]` or `1.` is harmless).
+    // renderer (it shows `\]`, `1\.`, `\=` and `\+` as written). A run that would
+    // open as a block (`+ x`, `# x`) is guarded where runs are drawn, in register.tsx.
     out = run.replace(/[\\`*_[<>|~]/g, c => '\\' + c)
-    // A word alone must not read as a block: a heading, quote, list item or rule.
-    if (isFirst) out = out.replace(/^([#+\-=])/, '\\$1')
   }
   if (style.s) out = `~~${out}~~`
   if (style.i) out = `*${out}*`
@@ -211,10 +210,6 @@ function wrap(run: string, style: Style, isFirst: boolean): string {
 }
 
 /** Terminal columns a string takes: wide East Asian and emoji 2, combining marks 0. */
-export function escapeWord(text: string): string {
-  return text.replace(/[\\`*_[<>|~]/g, c => '\\' + c).replace(/^([#+\-=])/, '\\$1')
-}
-
 export function textWidth(text: string): number {
   let width = 0
   for (const ch of text) {

@@ -22,7 +22,7 @@ import {
   texToUnicode,
 } from './latex'
 import type { Segment } from './latex'
-import { escapeWord, hasInlineMath, inlineTexes, layoutProse, textWidth } from './flow'
+import { hasInlineMath, inlineTexes, layoutProse, textWidth } from './flow'
 import type { Token } from './flow'
 
 // Pixels per terminal row the formulas are typeset at; the terminal scales
@@ -923,11 +923,27 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
       let run: { x: number; width: number; text: string } | undefined
       const endRun = () => {
         if (!run) return
-        const { x: at, width, text } = run
-        // Words with no markdown in them are plain text, folded into their row's one Text.
-        const plain = /[\\*_`~\[\]<>|]/.test(text) ? undefined : text
-        items.push({ x: at, width, up: 0, down: 0, isText: true, plain, cells: row => [[row, <Markdown text={text} />]] })
+        let { x: at, width, text } = run
         run = undefined
+        for (;;) {
+          // Words with no markdown in them are plain text, folded into their row's one Text.
+          const plain = /[\\*_`~\[\]<>|]/.test(text) ? undefined : text
+          // A Markdown run must not open as a block (`+ x` a list item, `# x` a heading),
+          // and the engine shows `\+` as written: its leading markers go out as plain text.
+          const lead = plain === undefined ? /^[#+\-=]+/.exec(text)?.[0] : undefined
+          if (lead === undefined) {
+            const t = text
+            items.push({ x: at, width, up: 0, down: 0, isText: true, plain, cells: row => [[row, <Markdown text={t} />]] })
+            return
+          }
+          items.push({ x: at, width: lead.length, up: 0, down: 0, isText: true, plain: lead, cells: row => [[row, <Text>{lead}</Text>]] })
+          const rest = text.slice(lead.length)
+          const skip = lead.length + rest.length - rest.trimStart().length
+          at += skip
+          width -= skip
+          text = rest.trimStart()
+          if (text === '') return
+        }
       }
       let x = left
       for (const token of tokens) {
@@ -963,8 +979,8 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
             failed.set(written, failures.get(failureId('inline', part.tex))!)
             items.push({ x: at, width: textWidth(written), up: 0, down: 0, isText: true, cells: row => [[row, <Text color="error">{written}</Text>]] })
           } else {
-            const alt = escapeWord(texToUnicode(part.tex) || ' ')
-            items.push({ x: at, width, up: 0, down: 0, isText: true, cells: row => [[row, <Markdown text={alt} />]] })
+            const alt = texToUnicode(part.tex) || ' '
+            items.push({ x: at, width, up: 0, down: 0, isText: true, plain: alt, cells: row => [[row, <Text>{alt}</Text>]] })
           }
           x += width
         }
