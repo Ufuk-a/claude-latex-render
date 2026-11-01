@@ -417,8 +417,10 @@ async function drawReply(
     afterPicture = false
     pendingText = ''
   }
+  let held = false
   segments.forEach((s, index) => {
     const picture = pictures[index]
+    if (held) return
     if (s.kind === 'markdown') {
       pendingText += s.text
     } else if (!picture && failures.has(failureId(s.kind, s.tex))) {
@@ -426,9 +428,9 @@ async function drawReply(
       const written = asWritten(s)
       children.push({ el: errorBlock(els, written, failures.get(failureId(s.kind, s.tex))!), guess: 2 + guessRows(written, room - 2) })
     } else if (!picture && s.kind === 'figure' && !opts.wait && figuresDrawn) {
-      // A figure still being typeset while the reply streams: a line saying so, not its source.
-      flushText()
-      children.push({ el: <Box marginLeft={2}><Text dimColor>drawing the figure…</Text></Box>, rows: 1 })
+      // A figure still being typeset while the reply streams holds it there,
+      // as an open fence does, so nothing below it moves when it appears.
+      held = true
     } else if (!picture) {
       pendingText += segmentsToUnicode([s])
     } else {
