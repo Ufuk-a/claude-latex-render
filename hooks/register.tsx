@@ -189,13 +189,15 @@ export const register: Register = (on, options) => {
   // What was found for the previous options no longer holds.
   canDraw = canDrawFigures = colors = undefined
 
-  // Tells the model how to write math and figures so they are drawn well here.
-  on('prompt.compose', async ($, e, next) => {
-    const composed = await next(e)
-    if (!e.surfaces.includes('terminal')) return composed
+  // Tells the model how to write math and figures so they are drawn well here. A context
+  // block, not a prompt.compose section: a session started with --system-prompt never
+  // composes one, and the guide has to reach every terminal session.
+  on('prompt.context', async ($, e, next) => {
+    const context = await next(e)
+    if (!(await $.session.surfaces()).includes('terminal')) return context
     const [pictures, figures, { paper }] = await Promise.all([imagesOn($), figuresOn($), palette($)])
-    const section = { id: 'latex-render:style', text: styleGuide({ pictures, figures, paper, inlinePictures: pictures && settings.inline }), scope: 'session' } as const
-    return { sections: [...composed.sections, section] }
+    const text = styleGuide({ pictures, figures, paper, inlinePictures: pictures && settings.inline })
+    return { ...context, blocks: [...context.blocks, { name: 'latexRender', text }] }
   })
 
   on('session.start', async ($, e, next) => {
