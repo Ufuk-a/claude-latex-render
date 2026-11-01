@@ -146,6 +146,27 @@ const drawnLayouts = new Map<string, Layout>()
 const drawnTrees = new Map<string, JSX.Element>()
 // The width the last reply was drawn at, so a formula is fitted to it while still streaming.
 let lastRoom: number | undefined
+// Each transcript row's layout as last drawn, by the row itself (a placed row's
+// id, a message's text) rather than by everything the layout depends on. The
+// engine asks again on every scroll step and drops an answer that is late, and a
+// row that changes height off screen snaps the scroll: so once a row has been
+// drawn it is always answered at once from here, at its height, and a layout
+// that needs redoing (another width) is redone behind it and swapped in.
+type RowLayout = { layout: Layout; key: string; room: number }
+const rowLayouts = new Map<string, RowLayout>()
+// The width each row was last asked to be redone at, so a redo that cannot
+// finish (a formula still failing) is not asked again on every scroll step.
+const redoneAt = new Map<string, number>()
+const roomOf = (columns: number) => Math.max(10, columns - 4)
+function fromRow(rowKey: string, room: number, onScreen: { first: number; last: number } | null | undefined, viewRows: number, redo: () => Promise<unknown>): JSX.Element | undefined {
+  const row = rowLayouts.get(rowKey)
+  if (!row) return undefined
+  if (row.room !== room && redoneAt.get(rowKey) !== room) {
+    redoneAt.set(rowKey, room)
+    void redo().catch(() => undefined)
+  }
+  return windowed(row.layout, row.key, onScreen, viewRows)
+}
 
 
 // Cumulative time per render hook, written for .claude_scripts/scroll_perf.sh when LATEX_RENDER_PERF is set.
@@ -297,6 +318,17 @@ export const register: Register = (on, options) => {
   // The live row: the held block drawn as the finished block will be; once the
   // block is finished, in fullscreen, the finished block itself.
   on('ui.render', { component: 'Placed' }, async ($, e, next) => perf($, 'Placed', async () => {
+    if (e.props.plugin === $.plugin.name && e.surface === 'terminal' && modeNow === 'render' && e.viewport) {
+      const rowKey = `placed\u0000${e.props.id}`
+      const text = doneById.get(e.props.id)
+      const room = roomOf(e.viewport.columns)
+      const kept = text === undefined ? undefined : fromRow(rowKey, room, e.props.onScreen, e.viewport.rows, async () => {
+        lastRoom = room
+        await drawReply($, e, text, { wait: true, bullet: true, plain: !hasMath(text), rowKey })
+        $.ui.invalidate('ui.render')
+      })
+      if (kept) return kept
+    }
     if (e.props.plugin === $.plugin.name && e.surface === 'terminal' && modeNow === 'render' && e.viewport && lastRoom !== undefined) {
       const text = doneById.get(e.props.id)
       const layout = text === undefined ? undefined : drawnLayouts.get(layoutKey(text, lastRoom, true, !hasMath(text), e.surface))
@@ -316,7 +348,7 @@ export const register: Register = (on, options) => {
     }
     const text = finished[e.props.id]
     if (text === undefined || !e.viewport || (await read($, mode)) === 'source') return next(e)
-    const tree = await drawReply($, e, text, { wait: true, bullet: true, plain: !hasMath(text), onScreen: e.props.onScreen, viewRows: e.viewport?.rows })
+    const tree = await drawReply($, e, text, { wait: true, bullet: true, plain: !hasMath(text), onScreen: e.props.onScreen, viewRows: e.viewport?.rows, rowKey: `placed\u0000${e.props.id}` })
     return tree ?? next(e)
   }))
 
@@ -332,6 +364,14 @@ export const register: Register = (on, options) => {
       }
       if (!hasMath(text)) return next(e)
       const room = Math.max(10, e.viewport.columns - 4)
+      const rowKey = `message\u0000${e.props.isFirstOfReply}\u0000${text}`
+      const kept = fromRow(rowKey, room, e.props.onScreen, e.viewport.rows, async () => {
+        await cells($, e.viewport!.columns)
+        lastRoom = room
+        await drawReply($, e, text, { wait: true, bullet: e.props.isFirstOfReply, rowKey })
+        $.ui.invalidate('ui.render')
+      })
+      if (kept) return kept
       const key = layoutKey(text, room, e.props.isFirstOfReply, undefined, e.surface)
       const layout = room === lastRoom ? drawnLayouts.get(key) : undefined
       if (layout) return windowed(layout, key, e.props.onScreen, e.viewport.rows)
@@ -353,7 +393,7 @@ export const register: Register = (on, options) => {
     }
     await cells($, e.viewport?.columns)
     lastRoom = Math.max(10, (e.viewport?.columns ?? TERM_COLS ?? 80) - 4)
-    const tree = await drawReply($, e, text, { wait: true, bullet: e.props.isFirstOfReply, onScreen: e.props.onScreen, viewRows: e.viewport?.rows })
+    const tree = await drawReply($, e, text, { wait: true, bullet: e.props.isFirstOfReply, onScreen: e.props.onScreen, viewRows: e.viewport?.rows, rowKey: `message\u0000${e.props.isFirstOfReply}\u0000${text}` })
     return tree ?? next(e)
   }))
 }
@@ -365,14 +405,17 @@ async function drawReply(
   $: EngineInterface,
   e: Parameters<EngineInterface['ui']['resolve']>[0],
   text: string,
-  opts: { wait: boolean; bullet: boolean; plain?: boolean; onScreen?: { first: number; last: number } | null; viewRows?: number },
+  opts: { wait: boolean; bullet: boolean; plain?: boolean; onScreen?: { first: number; last: number } | null; viewRows?: number; rowKey?: string },
 ): Promise<JSX.Element | undefined> {
   const room = lastRoom ?? 76
   // A finished reply is laid out once: the engine draws it again on every
   // scroll step that moves it, and only its window changes then.
   const memoKey = opts.wait ? layoutKey(text, room, opts.bullet, opts.plain, e.surface) : undefined
   const memo = memoKey === undefined ? undefined : drawnLayouts.get(memoKey)
-  if (memo) return windowed(memo, memoKey!, opts.onScreen, opts.viewRows)
+  if (memo) {
+    keepRow(opts.rowKey, memo, memoKey!, room)
+    return windowed(memo, memoKey!, opts.onScreen, opts.viewRows)
+  }
   const segments = opts.plain ? [{ kind: 'markdown' as const, text }] : splitMath(text)
   const els = $.ui.resolve(e)
   const { Box, Text, Image, Markdown } = els as any
@@ -457,9 +500,16 @@ async function drawReply(
   if (pictures.every((p, k) => p || segments[k]!.kind === 'markdown' || failures.has(failureId(segments[k]!.kind, (segments[k] as Drawn).tex)))) {
     if (drawnLayouts.size >= 300) drawnLayouts.delete(drawnLayouts.keys().next().value!)
     drawnLayouts.set(memoKey, layout)
+    keepRow(opts.rowKey, layout, memoKey, room)
     return windowed(layout, memoKey, opts.onScreen, opts.viewRows)
   }
   return assemble(layout)
+}
+
+function keepRow(rowKey: string | undefined, layout: Layout, key: string, room: number) {
+  if (rowKey === undefined) return
+  if (rowLayouts.size >= 2000 && !rowLayouts.has(rowKey)) rowLayouts.delete(rowLayouts.keys().next().value!)
+  rowLayouts.set(rowKey, { layout, key, room })
 }
 
 // A part of a drawn reply, in the column beside the bullet. With `rows` its
