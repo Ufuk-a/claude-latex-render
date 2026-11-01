@@ -173,11 +173,14 @@ export const register: Register = (on, options) => {
     let held: Held | undefined
     let settled = 0
     let blocks = 0
-    const release = function* () {
+    const release = async function* () {
       if (held) {
         const block = held
         held = undefined
         settled = 0
+        // Everything in the block is typeset before the engine draws it, so the
+        // finished message comes out at its final height and nothing moves after.
+        await Promise.race([readyAll($, block.text), $.clock.sleep(3000)]).catch(() => undefined)
         yield* block.before
         yield { ...(block.first as object), text: block.text } as Chunk<'turn.step'>
         yield* block.after
@@ -229,8 +232,7 @@ export const register: Register = (on, options) => {
     const state = await read($, live)
     if (e.props.plugin !== $.plugin.name || e.props.id !== state.id || !state.text || e.surface !== 'terminal') return next(e)
     await cells($, lastRoom === undefined ? undefined : lastRoom + 4)
-    const { stable, pending } = splitPending(state.text)
-    const tree = await drawReply($, e, stable, { wait: false, bullet: true, pending })
+    const tree = await drawReply($, e, splitPending(state.text), { wait: false, bullet: true })
     return tree ?? next(e)
   })
 
@@ -257,7 +259,7 @@ async function drawReply(
   $: EngineInterface,
   e: Parameters<EngineInterface['ui']['resolve']>[0],
   text: string,
-  opts: { wait: boolean; bullet: boolean; pending?: string },
+  opts: { wait: boolean; bullet: boolean },
 ): Promise<JSX.Element | undefined> {
   const room = lastRoom ?? 76
   const segments = splitMath(text)
@@ -327,7 +329,6 @@ async function drawReply(
     }
   })
   flushText()
-  if (opts.pending) children.push(<Box marginLeft={2}><Text dimColor>{opts.pending}</Text></Box>)
   if (children.length === 0) return undefined
   void Markdown
   // The blank row the engine leaves above each message, which a drawing of our own must keep.
@@ -347,6 +348,17 @@ function drawnIn(text: string): Drawn[] {
   return splitMath(text).filter((s): s is Drawn => s.kind !== 'markdown')
 }
 
+// Typesets every formula and figure of a block, display and inline, at the sizes it will be drawn.
+async function readyAll($: EngineInterface, text: string): Promise<void> {
+  const room = lastRoom ?? 76
+  const segments = splitMath(text)
+  const prose = segments.filter(s => s.kind === 'markdown').map(s => s.text).join('\n\n')
+  await Promise.all([
+    ...drawnIn(text).map(s => fit($, s, room)),
+    ...(settings.inline ? [...new Set(inlineTexes(prose))].map(tex => fitInline($, tex, room)) : []),
+  ]).catch(() => undefined)
+}
+
 // Typesets the formulas and figures that closed in a held piece, redrawing the band as each is ready.
 async function prepareLive($: EngineInterface, text: string): Promise<void> {
   await Promise.all(
@@ -358,8 +370,8 @@ async function prepareLive($: EngineInterface, text: string): Promise<void> {
   )
 }
 
-// The held text's typesettable part, and a placeholder for a formula or figure still open at its end.
-function splitPending(text: string): { stable: string; pending?: string } {
+// The held text without a formula or figure still open at its end, which shows once it closes.
+function splitPending(text: string): string {
   const opens: number[] = []
   const dollars = [...text.matchAll(/\$\$/g)].map(m => m.index ?? 0)
   if (dollars.length % 2 === 1) opens.push(dollars[dollars.length - 1]!)
@@ -372,19 +384,12 @@ function splitPending(text: string): { stable: string; pending?: string } {
   }
   const fence = [...text.matchAll(/^```/gm)].map(m => m.index ?? 0)
   if (fence.length % 2 === 1 && /^```tikz/.test(text.slice(fence[fence.length - 1]!))) opens.push(fence[fence.length - 1]!)
-  if (opens.length > 0) {
-    const at = Math.min(...opens)
-    const kind = text.slice(at).startsWith('```') || text.slice(at).includes('tikzpicture') ? 'figure' : 'formula'
-    return { stable: text.slice(0, at), pending: `⋯ ${kind}` }
-  }
-  // An inline formula still open on the last line is left for the next piece.
+  if (opens.length > 0) return text.slice(0, Math.min(...opens))
+  // An inline formula still open on the last line waits for its closing dollar.
   const lastLine = text.slice(text.lastIndexOf('\n') + 1)
   const singles = [...lastLine.replace(/\$\$/g, '').matchAll(/(?<!\\)\$/g)]
-  if (singles.length % 2 === 1) {
-    const cut = text.length - lastLine.length + lastLine.lastIndexOf('$')
-    return { stable: text.slice(0, cut) }
-  }
-  return { stable: text }
+  if (singles.length % 2 === 1) return text.slice(0, text.length - lastLine.length + lastLine.lastIndexOf('$'))
+  return text
 }
 
 
