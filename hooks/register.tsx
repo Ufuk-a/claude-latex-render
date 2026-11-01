@@ -52,7 +52,7 @@ type Settings = {
 
 // What the module learns once per load: its options, whether pictures can be
 // drawn, the cache folder, the colors, and every formula and figure typeset so far.
-let settings: Settings = { images: 'auto', color: 'auto', scale: 1.25, cellAspect: 2.1, preamble: '', background: 'auto', live: true, inline: true, inlineScale: 1.1, inlineBaseline: 0.8 }
+let settings: Settings = { images: 'auto', color: 'auto', scale: 1.25, cellAspect: 2.1, preamble: '', background: 'auto', live: true, inline: true, inlineScale: 1, inlineBaseline: 0.8 }
 let canDraw: Promise<boolean> | undefined
 let canDrawFigures: Promise<boolean> | undefined
 let cacheDir: Promise<string> | undefined
@@ -78,7 +78,7 @@ export const register: Register = (on, options) => {
     background: String(options.background ?? 'auto'),
     live: String(options.preview ?? 'on') !== 'off',
     inline: String(options.inlineImages ?? 'on') !== 'off',
-    inlineScale: clamp(Number(options.inlineScale) || 1.1, 0.5, 2),
+    inlineScale: clamp(Number(options.inlineScale) || 1, 0.5, 2),
     inlineBaseline: clamp(Number(options.inlineBaseline) || 0.8, 0.5, 0.95),
   }
   // What was found for the previous options no longer holds.
@@ -517,28 +517,30 @@ async function padInline($: EngineInterface, tex: string, room: number): Promise
   const base = settings.inlineBaseline * ROW_PX
   const under = ROW_PX - base
   const cellW = ROW_PX / settings.cellAspect
-  // Full size, the line growing rows above and below its text row as needed;
-  // a formula that overshoots one row only a little is shrunk to stay in it.
-  let shrink = Math.min(1, (room * cellW) / Math.max(1, t.width))
-  const rowsFor = (k: number) => ({
-    up: Math.ceil(Math.max(0, t.above * k - base) / ROW_PX),
-    down: Math.ceil(Math.max(0, t.below * k - under) / ROW_PX),
-  })
-  let { up, down } = rowsFor(shrink)
-  if (up + down > 0) {
-    const oneRow = Math.min(base / Math.max(1, t.above), under / Math.max(1, t.below), shrink)
-    if (oneRow >= 0.88 * shrink) {
-      shrink = oneRow
-      up = down = 0
+  // The line grows rows above and below its text row as far as the formula
+  // reaches. To spare a row, a formula may shrink a little and sit a little off
+  // the baseline: each choice is scored as its rows plus what it costs to look
+  // at, so a row is given up for small compromises and kept for big ones.
+  const widest = Math.min(1, (room * cellW) / Math.max(1, t.width))
+  const maxShift = 0.2 * ROW_PX
+  let best = { cost: Infinity, shrink: widest, shift: 0, up: 0, down: 0 }
+  for (let k = widest; k >= widest * 0.8 - 1e-9; k -= widest * 0.025) {
+    for (let shift = -maxShift; shift <= maxShift; shift += 1) {
+      const up = Math.ceil(Math.max(0, t.above * k + shift - base) / ROW_PX - 1e-9)
+      const down = Math.ceil(Math.max(0, t.below * k - shift - under) / ROW_PX - 1e-9)
+      const cost = up + down + 3 * (1 - k / widest) + (2 * Math.abs(shift)) / ROW_PX
+      if (cost < best.cost - 1e-9) best = { cost, shrink: k, shift, up, down }
     }
   }
+  const shrink = best.shrink
+  const { up, down } = best
   const rows = 1 + up + down
   const width = Math.max(1, Math.round(t.width * shrink))
   const height = Math.max(1, Math.round(t.height * shrink))
   const columns = clamp(Math.ceil(width / cellW), 1, 255)
   const canvasW = Math.round(columns * cellW)
   const canvasH = rows * ROW_PX
-  const top = Math.max(0, Math.round(up * ROW_PX + base - t.above * shrink))
+  const top = Math.max(0, Math.round(up * ROW_PX + base - best.shift - t.above * shrink))
   const dx = Math.max(0, Math.floor((canvasW - width) / 2))
   const out = t.path.replace(/\.png$/, `-i${columns}x${rows}t${top}w${width}.png`)
   if (!(await $.fs.exists(out))) {

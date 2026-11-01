@@ -75,7 +75,7 @@
       "type": "number",
       "title": "Inline formula scale",
       "description": "Size of inline formulas relative to the terminal text; raise it if they look small",
-      "default": 1.1
+      "default": 1
     },
     "inlineBaseline": {
       "type": "number",
