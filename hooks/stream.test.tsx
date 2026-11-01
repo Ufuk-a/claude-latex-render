@@ -48,19 +48,21 @@ const reply: Chunk<'turn.step'>[] = [
 ]
 
 describe('turn.step', () => {
-  test('a formula is typeset while the reply still streams', { options: { images: 'on' } }, async ($, on) => {
-    const { streamed, runs } = world(on, ['terminal'])
+  test('held text reaches the engine whole, before the block ends', { options: { images: 'on' } }, async ($, on) => {
+    const { streamed } = world(on, ['terminal'])
+    engine(on, streamed, reply)
+    const chunks = await collect($.turn.step(step))
+    const texts = chunks.filter(c => c.kind === 'text').map(c => (c as { text: string }).text)
+    // The line before the formula streams; from the formula's line on, the block is held and released in one piece.
+    expect(texts).toEqual(['Take\n', '$$x^2$$\n\nso it grows, and more text follows.'])
+    expect(chunks.map(c => c.kind)).toEqual(['text', 'text', 'tool', 'stop'])
+  })
+
+  test('a run with no terminal holds nothing back', { options: { images: 'on' } }, async ($, on) => {
+    const { streamed, runs } = world(on, [])
     engine(on, streamed, reply)
     const chunks = await collect($.turn.step(step))
     expect(chunks).toEqual([...reply, { kind: 'stop', stopReason: 'end_turn', usage: null }])
-    const latex = runs.find(r => r.program === 'latex' && r.at > 0)
-    expect(latex?.at).toBeLessThan(reply.length)
-  })
-
-  test('a run with no terminal typesets nothing', { options: { images: 'on' } }, async ($, on) => {
-    const { streamed, runs } = world(on, [])
-    engine(on, streamed, reply)
-    await collect($.turn.step(step))
     expect(runs.filter(r => r.at > 0)).toEqual([])
   })
 })
@@ -72,39 +74,38 @@ const PNG = btoa(
 
 const band = { hasSurvey: false, isWorking: true, maxRows: 20, bodyColumns: 80, scroll: { offset: 0, bodyRows: 19 }, view: {} }
 
-describe('preview', () => {
-  test('a formula shows above the prompt until its block ends', { options: { images: 'on' } }, async ($, on) => {
+describe('live band', () => {
+  test('held text shows above the prompt while its block streams, and goes when it ends', { options: { images: 'on' } }, async ($, on) => {
     on('session.surfaces', () => ({ value: ['terminal'] as const }))
     on('env.get', () => ({ value: undefined }))
     on('process.run', () => ({ value: ran }))
-    // Every picture is already typeset.
     on('fs.exists', (_$, e) => ({ value: e.path.endsWith('.png') }))
     on('fs.read', () => ({ value: { base64: PNG } }))
-    // Stands for the engine's own band.
     on('ui.render', { component: 'AbovePrompt' }, ($, e) => {
       const { Text } = $.ui.resolve(e)
       return <Text>prompt band</Text>
     })
-
+    let open!: () => void
+    const gate = new Promise<void>(resolve => (open = resolve))
     on('turn.step', async function* () {
       yield { kind: 'text', index: 0, text: 'Take\n$$x^2$$\n' } as const
       yield { kind: 'text', index: 0, text: '\nso it grows' } as const
+      await gate
       yield { kind: 'tool', index: 1, id: 'tu1', name: 'Read' } as const
       yield { kind: 'stop', stopReason: 'tool_use', usage: null } as const
       return { turnId: 't1', index: 0, answer: '', toolUses: [], stopReason: 'tool_use' as const, usage: null }
     })
     const view = await $.ui.mount({ plugin: 'latex-render', surface: 'terminal', component: 'AbovePrompt', props: band })
-    const previewing = async () => JSON.stringify(await view.drawn()).includes('LaTeX preview')
+    const showing = async () => JSON.stringify(await view.drawn()).includes('so it grows')
 
-    // Pulled a chunk at a time: the plugin acts on a chunk when the next is asked for.
     const stream = $.turn.step(step)[Symbol.asyncIterator]()
-    await stream.next() // the formula
-    expect(await previewing()).toBe(false)
-    await stream.next() // the text after it
-    expect(await previewing()).toBe(true)
-    await stream.next() // the tool call, ending the block
-    await stream.next() // the stop
-    expect(await previewing()).toBe(false)
+    await stream.next() // 'Take\n' streams; the rest is held
+    const released = stream.next() // waits on the gate, holding the formula and the text after it
+    for (let i = 0; i < 200; i++) await Promise.resolve()
+    expect(await showing()).toBe(true)
+    open()
+    expect(((await released).value as { text: string }).text).toBe('$$x^2$$\n\nso it grows')
     while (!(await stream.next()).done);
+    expect(await showing()).toBe(false)
   })
 })
