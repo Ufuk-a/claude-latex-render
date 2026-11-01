@@ -9,7 +9,7 @@
 
 import { inlineSpans, splitFences } from './latex'
 
-export type Part = { kind: 'md'; text: string } | { kind: 'math'; tex: string }
+export type Part = { kind: 'md'; text: string; width: number } | { kind: 'math'; tex: string }
 /** One word: the pieces drawn side by side with no space between them. */
 export type Token = Part[]
 export type ProseBlock =
@@ -163,7 +163,7 @@ export function tokenize(text: string, bold = false): Token[] {
   let run = ''
   let runStyle: Style | undefined
   const flushRun = () => {
-    if (run) token.push({ kind: 'md', text: wrap(run, runStyle!, token.length === 0) })
+    if (run) token.push({ kind: 'md', text: wrap(run, runStyle!, token.length === 0), width: textWidth(run) })
     run = ''
     runStyle = undefined
   }
@@ -205,4 +205,19 @@ function wrap(run: string, style: Style, isFirst: boolean): string {
   if (style.b) out = `**${out}**`
   if (style.link) out = `[${out}](${style.link})`
   return out
+}
+
+/** Terminal columns a string takes: wide East Asian and emoji 2, combining marks 0. */
+export function textWidth(text: string): number {
+  let width = 0
+  for (const ch of text) {
+    const c = ch.codePointAt(0)!
+    if (/\p{Mn}|\p{Me}|​|‍|️/u.test(ch)) continue
+    width += (c >= 0x1100 && c <= 0x115f) || (c >= 0x2e80 && c <= 0xa4cf) || (c >= 0xac00 && c <= 0xd7a3) ||
+      (c >= 0xf900 && c <= 0xfaff) || (c >= 0xfe30 && c <= 0xfe4f) || (c >= 0xff00 && c <= 0xff60) ||
+      (c >= 0xffe0 && c <= 0xffe6) || (c >= 0x1f300 && c <= 0x1faff) || (c >= 0x20000 && c <= 0x3fffd)
+      ? 2
+      : 1
+  }
+  return width
 }

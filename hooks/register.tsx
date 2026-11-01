@@ -22,7 +22,8 @@ import {
   texToUnicode,
 } from './latex'
 import type { Segment } from './latex'
-import { hasInlineMath, inlineTexes, layoutProse } from './flow'
+import { hasInlineMath, inlineTexes, layoutProse, textWidth } from './flow'
+import type { Token } from './flow'
 
 // Pixels per terminal row the formulas are typeset at; the terminal scales
 // the picture to its cells, so this only sets how crisp they are.
@@ -34,7 +35,7 @@ type Figure = Segment & { kind: 'figure' }
 type Drawn = Display | Figure
 type Palette = { ink: string; paper?: string }
 type Typeset = { path: string; width: number; height: number }
-type Picture = { path: string; columns: number; rows: number }
+type Picture = { path: string; columns: number; rows: number; rowsAbove?: number }
 
 type Settings = {
   images: string
@@ -51,7 +52,7 @@ type Settings = {
 
 // What the module learns once per load: its options, whether pictures can be
 // drawn, the cache folder, the colors, and every formula and figure typeset so far.
-let settings: Settings = { images: 'auto', color: 'auto', scale: 1.25, cellAspect: 2.1, preamble: '', background: 'auto', live: true, inline: true, inlineScale: 1, inlineBaseline: 0.8 }
+let settings: Settings = { images: 'auto', color: 'auto', scale: 1.25, cellAspect: 2.1, preamble: '', background: 'auto', live: true, inline: true, inlineScale: 1.1, inlineBaseline: 0.8 }
 let canDraw: Promise<boolean> | undefined
 let canDrawFigures: Promise<boolean> | undefined
 let cacheDir: Promise<string> | undefined
@@ -77,7 +78,7 @@ export const register: Register = (on, options) => {
     background: String(options.background ?? 'auto'),
     live: String(options.preview ?? 'on') !== 'off',
     inline: String(options.inlineImages ?? 'on') !== 'off',
-    inlineScale: clamp(Number(options.inlineScale) || 1, 0.5, 2),
+    inlineScale: clamp(Number(options.inlineScale) || 1.1, 0.5, 2),
     inlineBaseline: clamp(Number(options.inlineBaseline) || 0.8, 0.5, 0.95),
   }
   // What was found for the previous options no longer holds.
@@ -349,25 +350,66 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
       out.push(<Box marginTop={marginTop}><Markdown text={inlineToUnicode(block.text)} /></Box>)
       return
     }
-    const words = block.tokens.map(token => {
+    // Lines are broken here, so each knows the formulas it holds: a line grows
+    // above and below its text row as far as its tallest formula reaches, and
+    // every word and formula on it shares one baseline.
+    const markerWidth = block.marker ? textWidth(block.marker) + 1 : 0
+    const avail = Math.max(10, (lastRoom ?? 76) - block.indent - markerWidth - (block.quote ? 2 : 0))
+    const measured = block.tokens.map(token => {
       const parts = token.map(part => {
-        if (part.kind === 'md') return <Markdown text={part.text} />
+        if (part.kind === 'md') return { part, width: part.width, pic: undefined as Picture | undefined }
         const pic = picture(part.tex)
-        const alt = texToUnicode(part.tex) || ' '
-        return pic ? (
-          <Image key={key()} source={{ file: pic.path, format: 'png' }} columns={pic.columns} rows={pic.rows} alt={alt} />
-        ) : (
-          <Markdown text={escapeMarkdown(alt)} />
-        )
+        return { part, width: pic ? pic.columns : textWidth(texToUnicode(part.tex) || ' '), pic }
       })
-      return parts.length === 1 ? parts[0]! : <Box flexDirection="row" flexShrink={0}>{parts}</Box>
+      return { parts, width: parts.reduce((w, p) => w + p.width, 0) }
     })
+    const lines: (typeof measured)[] = []
+    let line: typeof measured = []
+    let used = 0
+    for (const token of measured) {
+      const need = line.length === 0 ? token.width : used + 1 + token.width
+      if (line.length > 0 && need > avail) {
+        lines.push(line)
+        line = []
+        used = 0
+      }
+      used = line.length === 0 ? token.width : used + 1 + token.width
+      line.push(token)
+    }
+    if (line.length > 0) lines.push(line)
+
+    const rendered = lines.map(tokens => {
+      const above = Math.max(0, ...tokens.flatMap(t => t.parts.map(p => p.pic?.rowsAbove ?? 0)))
+      return {
+        above,
+        el: (
+          <Box flexDirection="row" columnGap={1} alignItems="flex-start">
+            {tokens.map(t => (
+              <Box flexDirection="row" flexShrink={0}>
+                {t.parts.map(({ part, pic }) => {
+                  if (part.kind === 'md') return <Box marginTop={above}><Markdown text={part.text} /></Box>
+                  const alt = texToUnicode(part.tex) || ' '
+                  return pic ? (
+                    <Box marginTop={above - (pic.rowsAbove ?? 0)}>
+                      <Image key={key()} source={{ file: pic.path, format: 'png' }} columns={pic.columns} rows={pic.rows} alt={alt} />
+                    </Box>
+                  ) : (
+                    <Box marginTop={above}><Markdown text={escapeMarkdown(alt)} /></Box>
+                  )
+                })}
+              </Box>
+            ))}
+          </Box>
+        ),
+      }
+    })
+    const firstAbove = rendered[0]?.above ?? 0
     out.push(
       <Box flexDirection="row" marginTop={marginTop} marginLeft={block.indent}>
-        {block.marker ? <Box flexShrink={0} marginRight={1}><Text>{block.marker}</Text></Box> : null}
+        {block.marker ? <Box flexShrink={0} marginRight={1} marginTop={firstAbove}><Text>{block.marker}</Text></Box> : null}
         {block.quote ? <Box flexShrink={0} marginRight={1}><Text dimColor>▎</Text></Box> : null}
-        <Box flexDirection="row" flexWrap="wrap" columnGap={1} alignItems="flex-start" flexGrow={1} flexShrink={1}>
-          {words}
+        <Box flexDirection="column" flexGrow={1} flexShrink={1}>
+          {rendered.map(r => r.el)}
         </Box>
       </Box>,
     )
@@ -475,20 +517,28 @@ async function padInline($: EngineInterface, tex: string, room: number): Promise
   const base = settings.inlineBaseline * ROW_PX
   const under = ROW_PX - base
   const cellW = ROW_PX / settings.cellAspect
-  // Shrunk to fit above the baseline and within the line; a little more to stay one row, else the line grows.
-  let shrink = Math.min(1, base / Math.max(1, t.above), (room * cellW) / Math.max(1, t.width))
-  let rows = 1
-  if (t.below * shrink > under) {
-    const oneRow = under / Math.max(1, t.below)
-    if (oneRow >= 0.8 * shrink) shrink = oneRow
-    else rows = 1 + Math.ceil((t.below * shrink - under) / ROW_PX)
+  // Full size, the line growing rows above and below its text row as needed;
+  // a formula that overshoots one row only a little is shrunk to stay in it.
+  let shrink = Math.min(1, (room * cellW) / Math.max(1, t.width))
+  const rowsFor = (k: number) => ({
+    up: Math.ceil(Math.max(0, t.above * k - base) / ROW_PX),
+    down: Math.ceil(Math.max(0, t.below * k - under) / ROW_PX),
+  })
+  let { up, down } = rowsFor(shrink)
+  if (up + down > 0) {
+    const oneRow = Math.min(base / Math.max(1, t.above), under / Math.max(1, t.below), shrink)
+    if (oneRow >= 0.88 * shrink) {
+      shrink = oneRow
+      up = down = 0
+    }
   }
+  const rows = 1 + up + down
   const width = Math.max(1, Math.round(t.width * shrink))
   const height = Math.max(1, Math.round(t.height * shrink))
   const columns = clamp(Math.ceil(width / cellW), 1, 255)
   const canvasW = Math.round(columns * cellW)
   const canvasH = rows * ROW_PX
-  const top = Math.max(0, Math.round(base - t.above * shrink))
+  const top = Math.max(0, Math.round(up * ROW_PX + base - t.above * shrink))
   const dx = Math.max(0, Math.floor((canvasW - width) / 2))
   const out = t.path.replace(/\.png$/, `-i${columns}x${rows}t${top}w${width}.png`)
   if (!(await $.fs.exists(out))) {
@@ -497,7 +547,7 @@ async function padInline($: EngineInterface, tex: string, room: number): Promise
     const padded = await $.process.run(args, { timeoutMs: 15000 }).catch(() => undefined)
     if (padded?.exitCode !== 0) return undefined
   }
-  return { path: out, columns, rows }
+  return { path: out, columns, rows, rowsAbove: up }
 }
 
 function showMode($: EngineInterface, current: Mode): void {
