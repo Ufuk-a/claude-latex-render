@@ -193,6 +193,8 @@ async function perf<T>($: EngineInterface, name: string, run: () => Promise<T>):
   }
 }
 
+
+
 export const register: Register = (on, options) => {
   settings = {
     images: String(options.images ?? 'auto'),
@@ -322,7 +324,9 @@ export const register: Register = (on, options) => {
       const rowKey = `placed\u0000${e.props.id}`
       const text = doneById.get(e.props.id)
       const room = roomOf(e.viewport.columns)
-      const kept = text === undefined ? undefined : fromRow(rowKey, room, e.props.onScreen, e.viewport.rows, async () => {
+      // Drawn whole, never windowed: a placed row whose drawing changes as it
+      // comes back into view snaps the scroll (message rows window fine).
+      const kept = text === undefined ? undefined : fromRow(rowKey, room, undefined, e.viewport.rows, async () => {
         lastRoom = room
         await drawReply($, e, text, { wait: true, bullet: true, plain: !hasMath(text), rowKey })
         $.ui.invalidate('ui.render')
@@ -332,7 +336,7 @@ export const register: Register = (on, options) => {
     if (e.props.plugin === $.plugin.name && e.surface === 'terminal' && modeNow === 'render' && e.viewport && lastRoom !== undefined) {
       const text = doneById.get(e.props.id)
       const layout = text === undefined ? undefined : drawnLayouts.get(layoutKey(text, lastRoom, true, !hasMath(text), e.surface))
-      if (layout) return windowed(layout, layoutKey(text!, lastRoom, true, !hasMath(text!), e.surface), e.props.onScreen, e.viewport.rows)
+      if (layout) return windowed(layout, layoutKey(text!, lastRoom, true, !hasMath(text!), e.surface), undefined, e.viewport.rows)
     }
     const [state, finished] = await Promise.all([read($, live), read($, done)])
     for (const [id, t] of Object.entries(finished)) {
@@ -348,7 +352,7 @@ export const register: Register = (on, options) => {
     }
     const text = finished[e.props.id]
     if (text === undefined || !e.viewport || (await read($, mode)) === 'source') return next(e)
-    const tree = await drawReply($, e, text, { wait: true, bullet: true, plain: !hasMath(text), onScreen: e.props.onScreen, viewRows: e.viewport?.rows, rowKey: `placed\u0000${e.props.id}` })
+    const tree = await drawReply($, e, text, { wait: true, bullet: true, plain: !hasMath(text), viewRows: e.viewport?.rows, rowKey: `placed\u0000${e.props.id}` })
     return tree ?? next(e)
   }))
 
@@ -608,23 +612,23 @@ function assemble(layout: Layout, window?: [number, number]): JSX.Element {
       if (outside(y, part.rows)) blank += part.rows
       else {
         flushBlank(children)
-        children.push(part.el)
+        children.push(<Box flexShrink={0} flexDirection="column">{part.el}</Box>)
       }
       y += part.rows
     } else {
       flushBlank(children)
-      children.push(part.el)
+      children.push(<Box flexShrink={0} flexDirection="column">{part.el}</Box>)
       y += part.guess
     }
   }
   flushBlank(children)
   // The blank row the engine leaves above each message, which a drawing of our own must keep.
   return (
-    <Box flexDirection="row" marginTop={1}>
+    <Box flexDirection="row" marginTop={1} flexShrink={0}>
       <Box width={2} flexShrink={0} marginTop={layout.bulletRow}>
         <Text>{layout.bullet ? '●' : ' '}</Text>
       </Box>
-      <Box flexDirection="column" flexGrow={1}>
+      <Box flexDirection="column" flexGrow={1} flexShrink={0}>
         {children}
       </Box>
     </Box>
@@ -825,7 +829,7 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
         at = Math.max(at, piece.x + piece.width)
       }
       endWords()
-      return <Box flexDirection="row" height={1}>{row}</Box>
+      return <Box flexDirection="row" height={1} flexShrink={0}>{row}</Box>
     })
     // Rows the first line's formulas reach above its text count toward the gap before the canvas.
     const lead = placed[0]?.row ?? 0
