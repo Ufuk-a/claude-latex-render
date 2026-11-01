@@ -425,6 +425,10 @@ async function drawReply(
       flushText()
       const written = asWritten(s)
       children.push({ el: errorBlock(els, written, failures.get(failureId(s.kind, s.tex))!), guess: 2 + guessRows(written, room - 2) })
+    } else if (!picture && s.kind === 'figure' && !opts.wait && figuresDrawn) {
+      // A figure still being typeset while the reply streams: a line saying so, not its source.
+      flushText()
+      children.push({ el: <Box marginLeft={2}><Text dimColor>drawing the figure…</Text></Box>, rows: 1 })
     } else if (!picture) {
       pendingText += segmentsToUnicode([s])
     } else {
@@ -1082,12 +1086,15 @@ async function detectImages($: EngineInterface, option: string): Promise<boolean
 }
 
 // Figures take pdflatex and pdftocairo besides what formulas take.
+// Whether figures are drawn here, once figuresOn has found out.
+let figuresDrawn = false
 function figuresOn($: EngineInterface): Promise<boolean> {
   canDrawFigures ??= imagesOn($)
     .then(async on => {
       if (!on) return false
       const tools = await Promise.all(['pdflatex', 'pdftocairo'].map(tool => works($.process.run([tool, '-v']))))
-      return tools.every(Boolean)
+      figuresDrawn = tools.every(Boolean)
+      return figuresDrawn
     })
     .catch(err => {
       canDrawFigures = undefined
