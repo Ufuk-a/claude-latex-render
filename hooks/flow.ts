@@ -14,7 +14,7 @@ export type Part = { kind: 'md'; text: string; width: number } | { kind: 'math';
 export type Token = Part[]
 export type ProseBlock =
   | { kind: 'markdown'; text: string; gap: boolean }
-  | { kind: 'flow'; tokens: Token[]; marker?: string; quote?: boolean; indent: number; gap: boolean }
+  | { kind: 'flow'; tokens: Token[]; marker?: string; quote?: boolean; heading?: boolean; indent: number; gap: boolean }
 
 type Style = { b: boolean; i: boolean; s: boolean; c: boolean; link?: string }
 type Item = { ch: string; style: Style } | { math: string } | { space: true }
@@ -50,6 +50,7 @@ export function layoutProse(md: string): ProseBlock[] {
           tokens: tokenize(item.text, item.heading === true),
           ...(item.marker ? { marker: item.marker } : {}),
           ...(item.quote ? { quote: true } : {}),
+          ...(item.heading ? { heading: true } : {}),
           indent: item.indent,
           gap: n === 0,
         })

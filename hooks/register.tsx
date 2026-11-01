@@ -356,7 +356,7 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
   const out: JSX.Element[] = []
   const room = lastRoom ?? 76
   type Placed = { x: number; width: number; el: (top: number) => JSX.Element; up: number; down: number; isText: boolean }
-  type Line = { items: Placed[]; gap: number; marker?: { x: number; text: string }; quote?: number }
+  type Line = { items: Placed[]; gap: number; starts: boolean; heading: boolean; marker?: { x: number; text: string }; quote?: number }
   let group: Line[] = []
   let overhang = 0
   firstRow = 0
@@ -369,7 +369,13 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
     const take = (row: number, x0: number, x1: number) => taken.set(row, [...(taken.get(row) ?? []), [x0, x1]])
     const placed: { line: Line; row: number }[] = []
     let last = -1
+    let blockBottom = -1 // lowest row the block being placed reaches
+    let prevBottom = -1 // and the block before it
     for (const line of group) {
+      if (line.starts) {
+        prevBottom = blockBottom
+        blockBottom = -1
+      }
       const up = Math.max(0, ...line.items.map(i => i.up))
       const texts = line.items.filter(i => i.isText || i.up + i.down === 0)
       const textFrom = Math.min(...line.items.map(i => i.x), line.marker?.x ?? Infinity, line.quote ?? Infinity)
@@ -381,8 +387,13 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
           for (let r = row - i.up; r <= row + i.down; r++) if (r !== row && !free(r, i.x, i.x + i.width)) return false
           return true
         })
-      let row = Math.max(up, last < 0 ? 0 : last + 1 + line.gap)
+      // A block's text starts below everything the block before reaches: a heading
+      // a full gap below it, other text a gap below the last text (formulas
+      // hanging into that gap count toward it).
+      let row = Math.max(up, last < 0 ? 0 : last + 1 + (line.starts ? line.gap : 0))
+      if (line.starts && prevBottom >= 0) row = Math.max(row, prevBottom + 1 + (line.heading ? line.gap : 0))
       while (!fits(row)) row++
+      blockBottom = Math.max(blockBottom, row + Math.max(0, ...line.items.map(i => i.down)))
       take(row, textFrom, textTo)
       for (const i of line.items) for (let r = row - i.up; r <= row + i.down; r++) if (r !== row) take(r, i.x, i.x + i.width)
       placed.push({ line, row })
@@ -395,10 +406,13 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
       if (line.quote !== undefined) children.push(<Box position="absolute" top={row} left={line.quote}><Text dimColor>▎</Text></Box>)
       for (const item of line.items) children.push(item.el(row))
     }
-    if (out.length === 0) firstRow = marginTop + (placed[0]?.row ?? 0)
+    // Rows the first line's formulas reach above its text count toward the gap before the canvas.
+    const lead = placed[0]?.row ?? 0
+    const top = Math.max(0, marginTop - lead)
+    if (out.length === 0) firstRow = top + lead
     // Rows under the last line of text hold only overhanging formulas: they count toward the next gap.
     overhang = height - 1 - (placed[placed.length - 1]?.row ?? height - 1)
-    out.push(<Box marginTop={marginTop} position="relative" height={height} flexShrink={0}>{children}</Box>)
+    out.push(<Box marginTop={top} position="relative" height={height} flexShrink={0}>{children}</Box>)
     group = []
   }
 
@@ -408,7 +422,8 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
     if (block.kind === 'markdown') {
       flushGroup(pendingGap)
       pendingGap = 0
-      out.push(<Box marginTop={Math.max(0, gap - overhang)}><Markdown text={inlineToUnicode(block.text)} /></Box>)
+      const isHeading = /^\s{0,3}#/.test(block.text)
+      out.push(<Box marginTop={isHeading ? gap : Math.max(0, gap - overhang)}><Markdown text={inlineToUnicode(block.text)} /></Box>)
       overhang = 0
       return
     }
@@ -470,6 +485,8 @@ function drawProse(els: any, md: string, picture: (tex: string) => Picture | und
       group.push({
         items,
         gap: k === 0 && group.length > 0 ? gap : 0,
+        starts: k === 0,
+        heading: block.heading === true,
         ...(k === 0 && block.marker ? { marker: { x: block.indent, text: block.marker } } : {}),
         ...(block.quote ? { quote: block.indent } : {}),
       })
