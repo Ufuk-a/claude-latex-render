@@ -27,7 +27,52 @@ import type { Token } from './flow'
 
 // Pixels per terminal row the formulas are typeset at; the terminal scales
 // the picture to its cells, so this only sets how crisp they are.
-const ROW_PX = 40
+// Pixels per terminal row and column. Pictures are drawn at exactly the
+// terminal's cell size, read from its window when it can be, so the terminal
+// never rescales them (rescaling is what makes them jagged); 40 and the
+// cellAspect setting stand in where it cannot.
+let ROW_PX = 40
+let CELL_W: number | undefined
+let cellsFor: { columns: number; pending: Promise<void> } | undefined
+const CELL_PROBE = [
+  'import os, fcntl, termios, struct',
+  'p = os.getpid()',
+  'while p > 1:',
+  '    for fd in (0, 1, 2):',
+  '        try:',
+  '            t = os.readlink(f"/proc/{p}/fd/{fd}")',
+  '        except OSError:',
+  '            continue',
+  '        if t.startswith("/dev/pts/") or t.startswith("/dev/tty"):',
+  '            h = os.open(t, os.O_RDONLY | os.O_NOCTTY)',
+  '            r, c, x, y = struct.unpack("HHHH", fcntl.ioctl(h, termios.TIOCGWINSZ, bytes(8)))',
+  '            if x and y:',
+  '                print(x / c, y / r)',
+  '                raise SystemExit',
+  '    p = int(open(f"/proc/{p}/stat").read().rsplit(")", 1)[1].split()[1])',
+].join('\n')
+
+// Reads the cell size again whenever the terminal's width changes (a resize or a font zoom).
+function cells($: EngineInterface, columns: number | undefined): Promise<void> {
+  const key = columns ?? 0
+  if (cellsFor?.columns === key) return cellsFor.pending
+  const pending = $.process
+    .run(['python3', '-c', CELL_PROBE], { timeoutMs: 3000 })
+    .then(r => {
+      const [w, h] = r.stdout.trim().split(/\s+/).map(Number)
+      if (r.exitCode === 0 && w && h && w > 2 && h > 4) {
+        ROW_PX = Math.round(h)
+        CELL_W = w
+      }
+    })
+    .catch(() => undefined)
+  cellsFor = { columns: key, pending }
+  return pending
+}
+
+function cellWidth(): number {
+  return CELL_W ?? ROW_PX / settings.cellAspect
+}
 const VERSION = 1
 
 type Display = Segment & { kind: 'display' }
@@ -183,6 +228,7 @@ export const register: Register = (on, options) => {
   on('ui.render', { component: 'Placed' }, async ($, e, next) => {
     const state = await read($, live)
     if (e.props.plugin !== $.plugin.name || e.props.id !== state.id || !state.text || e.surface !== 'terminal') return next(e)
+    await cells($, lastRoom === undefined ? undefined : lastRoom + 4)
     const { stable, pending } = splitPending(state.text)
     const tree = await drawReply($, e, stable, { wait: false, bullet: true, pending })
     return tree ?? next(e)
@@ -198,6 +244,7 @@ export const register: Register = (on, options) => {
       return rewritten === text ? next(e) : next({ ...e, props: { ...e.props, text: rewritten } })
     }
     lastRoom = Math.max(10, (e.viewport?.columns ?? 80) - 4)
+    await cells($, e.viewport?.columns)
     const tree = await drawReply($, e, text, { wait: true, bullet: e.props.isFirstOfReply })
     return tree ?? next(e)
   })
@@ -246,12 +293,15 @@ async function drawReply(
   let pendingText = ''
   let keyer = 0
   let bulletRow = 0
+  let afterPicture = false
   const flushText = () => {
     const md = pendingText.replace(/^\s*\n/, '').replace(/\n\s*$/, '')
     if (md.trim() === '') return void (pendingText = '')
     const drawn = drawProse(els, md, tex => inlinePics.get(tex), () => `p${keyer++}`)
     if (children.length === 0) bulletRow = firstRow
+    if (children.length > 0 && afterPicture && /^\s{0,3}#/.test(md)) children.push(<Box height={1} />)
     children.push(...drawn)
+    afterPicture = false
     pendingText = ''
   }
   segments.forEach((s, index) => {
@@ -273,14 +323,16 @@ async function drawReply(
           />
         </Box>,
       )
+      afterPicture = true
     }
   })
   flushText()
   if (opts.pending) children.push(<Box marginLeft={2}><Text dimColor>{opts.pending}</Text></Box>)
   if (children.length === 0) return undefined
   void Markdown
+  // The blank row the engine leaves above each message, which a drawing of our own must keep.
   return (
-    <Box flexDirection="row">
+    <Box flexDirection="row" marginTop={1}>
       <Box width={2} flexShrink={0} marginTop={bulletRow}>
         <Text>{opts.bullet ? '●' : ' '}</Text>
       </Box>
@@ -504,7 +556,7 @@ const inlineFitted = new Map<string, Promise<Picture | undefined>>()
 const inlineReady = new Map<string, Picture | undefined>()
 
 function inlineId(tex: string, room: number): string {
-  return `${tex}\u0000${room}`
+  return `${ROW_PX}\u0000${cellWidth()}\u0000${tex}\u0000${room}`
 }
 
 function fitInline($: EngineInterface, tex: string, room: number): Promise<Picture | undefined> {
@@ -519,10 +571,11 @@ function fitInline($: EngineInterface, tex: string, room: number): Promise<Pictu
 }
 
 function typesetInline($: EngineInterface, tex: string): Promise<InlineSet | undefined> {
-  let pending = inlineTypeset.get(tex)
+  const id = `${ROW_PX}\u0000${tex}`
+  let pending = inlineTypeset.get(id)
   if (!pending) {
     pending = slot(() => runInlineLatex($, tex)).catch(() => undefined)
-    inlineTypeset.set(tex, pending)
+    inlineTypeset.set(id, pending)
   }
   return pending
 }
@@ -595,7 +648,7 @@ async function padInline($: EngineInterface, tex: string, room: number): Promise
   if (!t) return undefined
   const base = settings.inlineBaseline * ROW_PX
   const under = ROW_PX - base
-  const cellW = ROW_PX / settings.cellAspect
+  const cellW = cellWidth()
   // The line grows rows above and below its text row as far as the formula
   // reaches. To spare a row, a formula may shrink a little and sit a little off
   // the baseline: each choice is scored as its rows plus what it costs to look
@@ -703,7 +756,7 @@ async function pickPalette($: EngineInterface): Promise<Palette> {
 
 // Typesets one formula or figure to a tight transparent PNG, cached on disk by content.
 function typesetSegment($: EngineInterface, segment: Drawn): Promise<Typeset | undefined> {
-  const id = segment.kind === 'figure' ? `figure\u0000${segment.tex}` : `${segment.env}\u0000${segment.tex}`
+  const id = `${ROW_PX}\u0000` + (segment.kind === 'figure' ? `figure\u0000${segment.tex}` : `${segment.env}\u0000${segment.tex}`)
   let pending = typeset.get(id)
   if (!pending) {
     pending = (segment.kind === 'figure' ? runTikz($, segment) : runLatex($, segment)).catch(() => undefined)
@@ -798,7 +851,7 @@ async function runTikz($: EngineInterface, segment: Figure): Promise<Typeset | u
 // of cells, so the terminal's scaling to the box keeps its proportions.
 // Within `room` columns and, when given, `rowLimit` rows.
 function fitId(segment: Drawn, room: number, rowLimit?: number): string {
-  return `${segment.kind === 'figure' ? 'figure' : segment.env}\u0000${segment.tex}\u0000${room}\u0000${rowLimit ?? ''}`
+  return `${ROW_PX}\u0000${cellWidth()}\u0000${segment.kind === 'figure' ? 'figure' : segment.env}\u0000${segment.tex}\u0000${room}\u0000${rowLimit ?? ''}`
 }
 
 function fit($: EngineInterface, segment: Drawn, room: number, rowLimit?: number): Promise<Picture | undefined> {
@@ -815,13 +868,14 @@ function fit($: EngineInterface, segment: Drawn, room: number, rowLimit?: number
 async function padToCells($: EngineInterface, segment: Drawn, room: number, rowLimit?: number): Promise<Picture | undefined> {
   const base = await typesetSegment($, segment)
   if (!base) return undefined
-  const cellW = ROW_PX / settings.cellAspect
+  const cellW = cellWidth()
   const tall = rowLimit === undefined ? 1 : (rowLimit * ROW_PX) / base.height
   const shrink = Math.min(1, (room * cellW) / base.width, tall)
   const width = Math.max(1, Math.round(base.width * shrink))
   const height = Math.max(1, Math.round(base.height * shrink))
   const columns = clamp(Math.ceil(width / cellW), 1, 255)
-  const rows = clamp(Math.ceil(height / ROW_PX), 1, 255)
+  // A little air above and below: at least ~0.3 row each side, the picture centred in its rows.
+  const rows = clamp(Math.ceil(height / ROW_PX + 0.6), 1, 255)
   const out = base.path.replace(/\.png$/, `-${columns}x${rows}.png`)
 
   if (!(await $.fs.exists(out))) {
