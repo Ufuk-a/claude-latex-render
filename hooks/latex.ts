@@ -623,7 +623,8 @@ export function texDocument(segment: { tex: string; env?: string }, preamble: st
   if (env === 'alignat*' && !body.trimStart().startsWith('{')) env = 'align*'
   return [
     '\\documentclass[10pt]{article}',
-    '\\usepackage{amsmath,amssymb,amsfonts,mathtools,bm,xcolor,mathrsfs,cancel,braket,siunitx,physics}',
+    '\\usepackage{amsmath,amssymb,amsfonts,mathtools,bm,xcolor,mathrsfs,cancel,braket,siunitx,physics,esint}',
+    ...(/\\ce\{/.test(body) ? ['\\usepackage[version=4]{mhchem}'] : []),
     ...figureColors(Boolean(paper)),
     preamble,
     ...(ink ? [`\\definecolor{black}{HTML}{${ink.replace('#', '')}}`] : []),
@@ -645,10 +646,25 @@ export function texDocument(segment: { tex: string; env?: string }, preamble: st
  * mixed with, as in `blue!20`) becomes that background, so fills, masks and
  * tints stay dark; `black` is always the ink. Both are 6-digit hex.
  */
+// Packages a figure loads only when it uses them: each costs 10-80 ms of
+// preamble on every compile, and most figures need none.
+const OPTIONAL_FIGURE_PACKAGES: [RegExp, string][] = [
+  [/\\begin\{forest\}/, '\\usepackage{forest}'],
+  [/\\(?:texttiming|tikztiming|timing\b)|\\begin\{tikztimingtable\}/, '\\usepackage{tikz-timing}'],
+  [/\\begin\{karnaugh-map\}/, '\\usepackage{karnaugh-map}'],
+  [/\\feynmandiagram|\\begin\{feynman\}/, '\\usepackage{tikz-feynman}'],
+  [/\\tkz[A-Z]/, '\\usepackage{tkz-euclide}'],
+]
+
+// Environments that are whole pictures themselves, so a fence holding one is
+// not wrapped in another tikzpicture.
+const STANDALONE_FIGURE = /\\begin\{(?:tikzpicture|tikzcd|forest|karnaugh-map|tikztimingtable)\}|\\feynmandiagram/
+
 export function figureDocument(tex: string, preamble: string, ink: string, paper?: string): string {
   // standalone crops only tikzpicture pages; circuitikz parts work in any tikzpicture.
   tex = tex.replace(/\\(begin|end)\{circuitikz\}/g, '\\$1{tikzpicture}')
-  const body = /\\begin\{(?:tikzpicture|tikzcd)\}/.test(tex)
+  const optional = OPTIONAL_FIGURE_PACKAGES.filter(([used]) => used.test(tex)).map(([, line]) => line)
+  const body = STANDALONE_FIGURE.test(tex)
     ? tex
     : `\\begin{tikzpicture}\n${tex}\n\\end{tikzpicture}`
   const dark = paper ? hexRgb(paper) : undefined
@@ -657,7 +673,9 @@ export function figureDocument(tex: string, preamble: string, ink: string, paper
     '\\usepackage{amsmath,amssymb,amsfonts,mathtools,bm,pgfplots,mathrsfs,cancel,braket,siunitx,physics,tikz-3dplot}',
     '\\usepackage[american]{circuitikz}',
     '\\pgfplotsset{compat=1.18,every axis/.append style={axis on top}}',
-    '\\usetikzlibrary{arrows.meta,calc,cd,decorations.pathreplacing,decorations.markings,decorations.pathmorphing,patterns,positioning,shapes.geometric,shapes.misc,intersections,angles,quotes,backgrounds,fit,matrix,3d}',
+    '\\usetikzlibrary{arrows.meta,calc,cd,decorations.pathreplacing,decorations.markings,decorations.pathmorphing,decorations.text,decorations.shapes,patterns,patterns.meta,positioning,shapes.geometric,shapes.misc,shapes.arrows,shapes.symbols,shapes.multipart,shapes.callouts,intersections,angles,quotes,backgrounds,fit,matrix,3d,chains,automata,mindmap,trees,shadows,fadings,bending,plotmarks,spy,graphs,petri,through}',
+    '\\usepgfplotslibrary{fillbetween,groupplots,polar,colormaps,statistics,ternary,smithchart}',
+    ...optional,
     ...figureColors(Boolean(paper)),
     preamble,
     `\\definecolor{black}{HTML}{${ink.replace('#', '')}}`,
@@ -740,7 +758,7 @@ export function styleGuide({ pictures, figures, paper, inlinePictures }: StyleFa
     '- Inline: `$…$` or `\\(…\\)`, on one line. The opening `$` must not be followed by a space and the closing one not preceded by one; a `$` touching a digit or letter outside it (`$5`, `US$5`, `5$`) is a price and stays text, while `$n$th` is math. Write a literal dollar as `\\$`.',
     ...(inlinePictures ? INLINE_PICTURES : INLINE_UNICODE),
     '- Display: `$$…$$` or `\\[…\\]` on lines of their own, or a bare `equation`, `align`, `gather`, `multline`, `flalign` or `alignat` environment (starred or not). Nothing is numbered and `\\label` is dropped, so refer to formulas in words. A `$$` block containing `&` (and no `\\begin`) is set as `align*`, otherwise as `gather*`, so `\\\\` breaks lines and `&` aligns them; `aligned`, `cases`, `pmatrix`, `bmatrix`, `vmatrix`, `array` and `\\underbrace` work inside. Display math sits at the left margin.',
-    '- Loaded: amsmath, amssymb, amsfonts, mathtools, bm, mathrsfs, cancel, braket, xcolor, siunitx, physics. So `\\text{}`, `\\operatorname{Res}`, `\\bm{v}`, `\\mathscr{F}`, `\\cancel{x}`, `\\bra{\\psi}`/`\\ket{}`/`\\braket{}`, `\\color{red}`, `\\boxed{}`, `\\SI{4.7}{\\kilo\\ohm}`, `\\dv{f}{x}` and `\\abs{z}` all work. Other packages are not loaded.',
+    '- Loaded: amsmath, amssymb, amsfonts, mathtools, bm, mathrsfs, cancel, braket, xcolor, siunitx, physics, esint (`\\oiint`), and mhchem when a formula uses `\\ce{}`. So `\\text{}`, `\\operatorname{Res}`, `\\bm{v}`, `\\mathscr{F}`, `\\cancel{x}`, `\\bra{\\psi}`/`\\ket{}`/`\\braket{}`, `\\color{red}`, `\\boxed{}`, `\\SI{4.7}{\\kilo\\ohm}`, `\\dv{f}{x}` and `\\abs{z}` all work. Other packages are not loaded.',
     '- A formula or figure using `\\def`, `\\newcommand`, `\\let`, `\\input`, `\\write`, `\\csname`, `\\usepackage` or other macro and file primitives is never compiled; repeat the expression instead (in TikZ, `\\pgfmathsetmacro` and `\\tikzset` are fine).',
     '- A formula that fails to compile is shown exactly as written, in red, so a typo is visible but costs only that formula. Balance braces and `\\left`/`\\right` pairs.',
     '- A bare number is plain text: write 0 or 3.5, not `$0$`. Math inside bold, italics and lists is fine.',
@@ -755,8 +773,8 @@ export function styleGuide({ pictures, figures, paper, inlinePictures }: StyleFa
     lines.push(
       '',
       'Figures:',
-      '- Diagrams, contours, graphs, plots and commutative diagrams go in a ```tikz fenced block, never loose in the text or in a ```latex block. The fence holds bare TikZ commands (`\\draw …;`, wrapped in a `tikzpicture` for you) or one whole `tikzpicture`, `circuitikz`, `tikzcd` or pgfplots `axis` environment. Write no `\\documentclass`, `\\usepackage` or `\\begin{document}`.',
-      '- Loaded: TikZ, pgfplots (compat 1.18), tikz-cd, circuitikz (american style: `to[R=$R_1$]`, `to[C]`, `to[L]`, `to[battery1]`, `to[sV]`, `to[isource]`, `to[D]`, poles `*-o`), tikz-3dplot and the libraries arrows.meta, calc, cd, decorations.pathreplacing, decorations.markings, decorations.pathmorphing, patterns, positioning, shapes.geometric, shapes.misc, intersections, angles, quotes, backgrounds, fit, matrix and 3d, plus the math packages above, so node labels take math (`node[right] {$z_0$}`). Arrow tips: `->`, `-{Stealth}`, `-{Latex}`.',
+      '- Diagrams, contours, graphs, plots and commutative diagrams go in a ```tikz fenced block, never loose in the text or in a ```latex block. The fence holds bare TikZ commands (`\\draw …;`, wrapped in a `tikzpicture` for you) or one whole `tikzpicture`, `circuitikz`, `tikzcd`, `forest`, `karnaugh-map`, `tikztimingtable` or pgfplots `axis` environment. Write no `\\documentclass`, `\\usepackage` or `\\begin{document}`.',
+      '- Loaded: TikZ, pgfplots (compat 1.18; libraries fillbetween, groupplots, polar, colormaps, statistics, ternary, smithchart), tikz-cd, circuitikz (american style; a whole `circuitikz` environment is fine: `to[R=$R_1$]`, `to[C]`, `to[L]`, `to[battery1]`, `to[sV]`, `to[isource]`, `to[D]`, poles `*-o`), tikz-3dplot and the TikZ libraries arrows.meta, calc, cd, decorations (pathreplacing, markings, pathmorphing, text, shapes), patterns(.meta), positioning, shapes (geometric, misc, arrows, symbols, multipart, callouts), intersections, angles, quotes, backgrounds, fit, matrix, 3d, chains, automata, mindmap, trees, shadows, fadings, bending, plotmarks, spy, graphs, petri and through. Loaded on use: forest (`\\begin{forest}`), tikz-timing (`tikztimingtable`), karnaugh-map, tikz-feynman (manual vertices; no automatic layout under pdflatex), tkz-euclide (`\\tkz…`). Also the math packages above, so node labels take math (`node[right] {$z_0$}`). Arrow tips: `->`, `-{Stealth}`, `-{Latex}`.',
       '- Scale: 1 cm of TikZ is about 3 terminal rows tall and 6 columns wide. Figures of 4 to 8 cm look right; wider than the reply column, one is shrunk to fit.',
     )
   } else if (pictures) {
