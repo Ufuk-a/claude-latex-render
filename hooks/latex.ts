@@ -654,11 +654,12 @@ const OPTIONAL_FIGURE_PACKAGES: [RegExp, string][] = [
   [/\\begin\{karnaugh-map\}/, '\\usepackage{karnaugh-map}'],
   [/\\feynmandiagram|\\begin\{feynman\}/, '\\usepackage{tikz-feynman}'],
   [/\\tkz[A-Z]/, '\\usepackage{tkz-euclide}'],
+  [/\\chemfig\b/, '\\usepackage{chemfig}'],
 ]
 
 // Environments that are whole pictures themselves, so a fence holding one is
 // not wrapped in another tikzpicture.
-const STANDALONE_FIGURE = /\\begin\{(?:tikzpicture|tikzcd|forest|karnaugh-map|tikztimingtable)\}|\\feynmandiagram/
+const STANDALONE_FIGURE = /\\begin\{(?:tikzpicture|tikzcd|forest|karnaugh-map|tikztimingtable)\}|\\feynmandiagram|^\s*\\chemfig\b/
 
 export function figureDocument(tex: string, preamble: string, ink: string, paper?: string): string {
   // standalone crops only tikzpicture pages; circuitikz parts work in any tikzpicture.
@@ -774,7 +775,7 @@ export function styleGuide({ pictures, figures, paper, inlinePictures }: StyleFa
       '',
       'Figures:',
       '- Diagrams, contours, graphs, plots and commutative diagrams go in a ```tikz fenced block, never loose in the text or in a ```latex block. The fence holds bare TikZ commands (`\\draw …;`, wrapped in a `tikzpicture` for you) or one whole `tikzpicture`, `circuitikz`, `tikzcd`, `forest`, `karnaugh-map`, `tikztimingtable` or pgfplots `axis` environment. Write no `\\documentclass`, `\\usepackage` or `\\begin{document}`.',
-      '- Loaded: TikZ, pgfplots (compat 1.18; libraries fillbetween, groupplots, polar, colormaps, statistics, ternary, smithchart), tikz-cd, circuitikz (american style; a whole `circuitikz` environment is fine: `to[R=$R_1$]`, `to[C]`, `to[L]`, `to[battery1]`, `to[sV]`, `to[isource]`, `to[D]`, poles `*-o`), tikz-3dplot and the TikZ libraries arrows.meta, calc, cd, decorations (pathreplacing, markings, pathmorphing, text, shapes), patterns(.meta), positioning, shapes (geometric, misc, arrows, symbols, multipart, callouts), intersections, angles, quotes, backgrounds, fit, matrix, 3d, chains, automata, mindmap, trees, shadows, fadings, bending, plotmarks, spy, graphs, petri and through. Loaded on use: forest (`\\begin{forest}`), tikz-timing (`tikztimingtable`), karnaugh-map, tikz-feynman (manual vertices; no automatic layout under pdflatex), tkz-euclide (`\\tkz…`). Also the math packages above, so node labels take math (`node[right] {$z_0$}`). Arrow tips: `->`, `-{Stealth}`, `-{Latex}`.',
+      '- Loaded: TikZ, pgfplots (compat 1.18; libraries fillbetween, groupplots, polar, colormaps, statistics, ternary, smithchart), tikz-cd, circuitikz (american style; a whole `circuitikz` environment is fine: `to[R=$R_1$]`, `to[C]`, `to[L]`, `to[battery1]`, `to[sV]`, `to[isource]`, `to[D]`, poles `*-o`), tikz-3dplot and the TikZ libraries arrows.meta, calc, cd, decorations (pathreplacing, markings, pathmorphing, text, shapes), patterns(.meta), positioning, shapes (geometric, misc, arrows, symbols, multipart, callouts), intersections, angles, quotes, backgrounds, fit, matrix, 3d, chains, automata, mindmap, trees, shadows, fadings, bending, plotmarks, spy, graphs, petri and through. Loaded on use: forest (`\\begin{forest}`), tikz-timing (`tikztimingtable`), karnaugh-map, tikz-feynman (manual vertices; no automatic layout under pdflatex), tkz-euclide (`\\tkz…`), chemfig (a fence holding just `\\chemfig{…}` is fine). Also the math packages above, so node labels take math (`node[right] {$z_0$}`). Arrow tips: `->`, `-{Stealth}`, `-{Latex}`.',
       '- Scale: 1 cm of TikZ is about 3 terminal rows tall and 6 columns wide. Figures of 4 to 8 cm look right; wider than the reply column, one is shrunk to fit.',
     )
   } else if (pictures) {

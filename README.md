@@ -8,7 +8,7 @@ A Claude Code mod that typesets the LaTeX in Claude's replies, right in the term
 
 - **Display math** (`$$…$$`, `\[…\]`, `equation`, `align`, `gather`, …) is typeset with `latex` + `dvipng` and drawn as an image through the kitty graphics protocol.
 - **Inline math** (`$…$`, `\(…\)`) is typeset too and drawn inside the line, on the same baseline as the terminal's text. Bold, italics, code and links around it keep their formatting.
-- **TikZ figures** (a ` ```tikz ` fenced block, or a bare `tikzpicture` or `tikzcd` environment) are compiled with `pdflatex` + `pdftocairo`. A fence may hold bare commands (`\draw …;`). `pgfplots` (with fillbetween, groupplots, polar…), `tikz-cd`, `circuitikz`, `tikz-3dplot` and most TikZ libraries are loaded; `forest`, `tikz-timing`, `karnaugh-map`, `tikz-feynman` and `tkz-euclide` load only when a figure uses them. A fence may also hold a whole `circuitikz`, `forest`, `karnaugh-map` or `tikztimingtable` environment. Math loads `siunitx`, `physics`, `esint`, and `mhchem` when `\ce{}` appears. On a dark theme `black` is the theme's ink, `white` and tints like `blue!20` turn dark, and named colors too dim for the background are lightened.
+- **TikZ figures** (a ` ```tikz ` fenced block, or a bare `tikzpicture` or `tikzcd` environment) are compiled with `pdflatex` + `pdftocairo`. A fence may hold bare commands (`\draw …;`). `pgfplots` (with fillbetween, groupplots, polar…), `tikz-cd`, `circuitikz`, `tikz-3dplot` and most TikZ libraries are loaded; `forest`, `tikz-timing`, `karnaugh-map`, `tikz-feynman`, `tkz-euclide` and `chemfig` load only when a figure uses them. A fence may also hold a whole `circuitikz`, `forest`, `karnaugh-map` or `tikztimingtable` environment. Math loads `siunitx`, `physics`, `esint`, and `mhchem` when `\ce{}` appears. On a dark theme `black` is the theme's ink, `white` and tints like `blue!20` turn dark, and named colors too dim for the background are lightened.
 - **Live and in place.** Each text block is typeset while it streams, in the spot where the reply is being written; raw LaTeX never shows. A formula still being written appears once it is complete.
 - **Sharp at any size.** Pictures are made at exactly the terminal's cell size, read from the terminal itself, so the terminal never rescales them.
 - **Compact lines.** A tall inline formula (a fraction, a binomial) takes the rows above and below its line only where they are free, may shrink slightly or sit slightly off the baseline to spare a row, and leaves a little air around itself.
@@ -29,7 +29,7 @@ Answer `y` to add the marketplace, then pick the user scope to have it in every 
 - Claude Code with mods (function hooks).
 - A terminal with the kitty graphics protocol: kitty, Ghostty or WezTerm. Inside tmux or over ssh, math falls back to Unicode text.
 - `latex` and `dvipng` (TeX Live: `texlive-scheme-basic` plus `dvipng`), with `amsmath`, `amssymb`, `mathtools`, `bm`, `mathrsfs`, `cancel`, `braket` and `preview`.
-- For figures, `pdflatex` and `pdftocairo` (poppler-utils), with `pgfplots`, `tikz-cd` and `circuitikz` (TeX Live's `pictures` and `mathscience` collections cover everything loaded).
+- For figures, `pdflatex` and `pdftocairo` (poppler-utils), with `pgfplots`, `tikz-cd` and `circuitikz` (TeX Live's `pictures`, `mathscience` and `plaingeneric` collections cover everything loaded; on Arch, chemfig needs `texlive-plaingeneric`, which `texlive-pictures` doesn't pull in).
 - ImageMagick (`magick`), which fits each picture to whole terminal cells.
 - `python3`, which reads the terminal's cell size.
 
